@@ -1,10 +1,63 @@
-# gtx-970-rgb-control
+# gtx-970-light-control
 
-Control the WINDFORCE logo light on a Gigabyte GTX 970 G1 Gaming
-(`GV-N970G1 GAMING-4GD`, PCI `10de:13c2` subsystem `1458:367a`) from Linux.
+Brightness, effects and night dimming for the WINDFORCE logo light on a
+Gigabyte GTX 970 G1 Gaming, from Linux. Worked out and built by an AI agent
+that could see the card through a webcam.
 
-Despite the repository name, the light is not RGB: it is a single blue LED.
-What you get is brightness, effects, and night dimming.
+![The logo at 100%, at 20%, and off, as seen by the webcam](docs/logo-levels.jpg)
+
+## How this came about
+
+The brief, typed to Claude Code on the machine itself:
+
+> this machine has a gigabyte windforce gtx 970 that has an rgb light on it.
+> when I first got it, I was able to control that light. At some point, that
+> option was taken away. See if you can figure out how to control it again. I
+> set up a web cam pointed at it, so you should be able to see whether it's
+> changed or not.
+
+What the agent did with it, in order:
+
+1. **Looked at the machine.** A GTX 970 with a Gigabyte subsystem ID, running
+   the open-source nouveau driver, with 21 I2C buses and one webcam. The first
+   frame from the webcam showed the logo, lit blue.
+
+   ![What the agent saw](docs/webcam-view.jpg)
+
+2. **Chased the obvious idea, and dropped it.** Newer Gigabyte cards have an RGB
+   controller chip on an I2C bus, and tools such as OpenRGB talk to it. Searching
+   turned up no such thing for this card. It turned up something better: reviews
+   from the card's era saying the logo was controlled by the LED Visualizer in NVIDIA's
+   GeForce Experience, and that it was blue only.
+3. **Followed what that implied.** If NVIDIA's own software drove the light, the
+   card must use NVIDIA's reference logo-LED output, the one behind the GEFORCE
+   GTX logo on reference cards. nouveau has a driver for that output. One `ls`
+   later: `/sys/class/leds/nvidia-logo`, sitting there the whole time, writable
+   only by root and reset to full brightness on every boot.
+4. **Proved it with the camera.** Wrote `0` to the LED; lit pixels in the logo
+   region went from 1183 to 0. Then 16, 64, 128 and 255 gave 388, 611, 799 and
+   1140.
+5. **Checked the premise.** The card's firmware names it `GV-N970G1 GAMING-4GD`.
+   That model's logo is a single blue LED, so the "RGB" in the brief was a
+   misremembering, and the option that "was taken away" was NVIDIA dropping the
+   LED Visualizer.
+6. **Built the tool, and kept watching.** Each effect was checked by sampling
+   the webcam over a few seconds. This is the logo's brightness over time, one
+   character per video frame:
+
+   ```
+   breathe    %@@@@@@@@@@@@%%%%%%######**********++++++===========------------:::                 .:::::---------------=========++=++
+   blink      -%@@@@@@@@@@@@@@               #@@@@@@@@@@@@@@-              #@@@@@@@@@@@@@@*              *@@@@@@@@@@@@@@%
+   heartbeat      *@@ -#@          +%% -#@:         +%% =%@-         =%% -#@          =%% -#@          +%@ :#@-         =@%  #@=
+   ```
+
+   The camera also caught a mode that did nothing. A "cpu" effect ran without
+   error, but the logo never changed, so it was replaced with one that works.
+
+The human's part: aiming the webcam, typing a sudo password, and asking for the
+night schedule afterwards.
+
+## Using it
 
 ```
 gpu-logo off                 # dark
@@ -21,10 +74,10 @@ gpu-logo status
 The mode you pick is remembered and re-applied at boot. Add `--no-save` before
 the command to try something without remembering it.
 
-## Night dimming
+### Night dimming
 
 ```
-gpu-logo schedule --from 22:00 --to 07:00 --level 10 --fade 30 --tz America/New_York
+gpu-logo schedule --from 01:30 --to 08:30 --level 10 --fade 30 --tz America/New_York
 gpu-logo schedule            # show the schedule and what it is doing right now
 gpu-logo schedule --off      # remove it
 ```
@@ -39,24 +92,7 @@ replacing it: a breathing logo keeps breathing, just fainter.
 | `--fade` | Minutes each transition takes, starting at the given time. `0` switches instantly. Default 30. |
 | `--tz` | Timezone the times are in. Defaults to the system clock's, which on a server is often UTC; `gpu-logo schedule` prints the time it is working from. |
 
-## What was found
-
-- **The light is blue only.** It is a single-colour LED: brightness and effects
-  can be controlled, colour cannot. Reviews and owner reports from the card's
-  era say the same, and the only colour changes people managed were physical
-  LED swaps.
-- **It is NVIDIA's reference "logo LED", not a Gigabyte RGB controller.** The
-  card wires the logo to the GPU's own logo-LED PWM output, the same mechanism
-  as the GEFORCE GTX logo on reference cards. On Windows that was driven by the
-  LED Visualizer in GeForce Experience, which NVIDIA later dropped from it.
-- **nouveau already drives it.** The open-source Linux driver registers the
-  output as a standard kernel LED at `/sys/class/leds/nvidia-logo` (0-255). Out
-  of the box only root can write it, and it resets to full brightness every
-  boot, so it looks uncontrollable.
-
-Nothing here talks to the card directly; it all goes through that kernel LED.
-
-## The CPU load meter
+### The CPU load meter
 
 `gpu-logo activity` uses the kernel's `activity` LED trigger. It shows one
 number, total CPU use across every logical core, by how the logo flashes:
@@ -70,7 +106,19 @@ number, total CPU use across every logical core, by how the logo flashes:
 It never goes fully steady, so a hung machine looks different from an idle or a
 saturated one. It cannot show cores individually: there is one LED.
 
+## Setting it up
+
+Hand it to your agent: [AGENTS.md](AGENTS.md) tells it how to check whether your
+card qualifies, install, and prove the light responds.
+
+By hand: `sudo ./install.sh`, and `sudo ./uninstall.sh` to remove everything.
+It needs the nouveau driver, systemd, Python 3.10 or newer, and membership of
+the `plugdev` group.
+
 ## How it works
+
+Nothing here talks to the card directly; it all goes through the kernel LED
+that nouveau provides.
 
 | Piece | Role |
 | --- | --- |
@@ -80,30 +128,12 @@ saturated one. It cannot show cores individually: there is one LED.
 | `modules-load.d/gpu-logo.conf` | Loads the trigger modules at boot. |
 | `/var/lib/gpu-logo/` | The saved mode, the schedule, and a note of what was last applied. Group-writable, so everything read from it is validated strictly before root acts on it. |
 | `tools/observe.py` | Measures the logo through a webcam, to confirm a command changed the real light. |
+| `tests/` | Schedule arithmetic, input validation and mode logic against a fake LED directory: `python3 -m unittest discover tests` |
 
-## Install
+## What was verified
 
-```
-sudo ./install.sh
-```
-
-Requires the `nouveau` driver, systemd, Python 3.10 or newer, and membership of
-the `plugdev` group. Re-run it after editing `gpu-logo`; the installed copy
-lives in `/usr/local/bin`. `sudo ./uninstall.sh` removes everything.
-
-## Tests
-
-```
-python3 -m unittest discover tests
-```
-
-These cover the schedule arithmetic, input validation and mode logic against a
-fake LED directory, so they run anywhere.
-
-## Verified
-
-Tested on Ubuntu 24.04 (kernel 6.8, nouveau) with a webcam aimed at the card,
-counting lit pixels in the logo region:
+On Ubuntu 24.04 (kernel 6.8, nouveau), by counting lit pixels in the logo
+region of the webcam image:
 
 - off, and brightness 16 / 64 / 128 / 255, each produced a distinct level
 - breathe, blink, heartbeat, activity (idle and with all cores busy) and disk
@@ -116,12 +146,12 @@ Not tested: an actual reboot, and suspend/resume.
 
 ## Limits
 
-- Colour cannot change; see above.
+- Colour cannot change: the LED is blue.
 - nouveau only. NVIDIA's proprietary driver does not create
   `/sys/class/leds/nvidia-logo`. It has its own `GPULogoBrightness` setting in
   `nvidia-settings`, which is untested with this card.
 - Other cards: anything nouveau exposes as `nvidia-logo` should work, but only
-  this model has been tried.
+  this model (PCI `10de:13c2`, subsystem `1458:367a`) has been tried.
 - `tools/observe.py` has the logo's position in the webcam frame hard-coded
   (`ROI`); re-tune it for your own camera.
 
