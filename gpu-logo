@@ -1,0 +1,246 @@
+#!/usr/bin/env python3
+"""gpu-logo: control the WINDFORCE logo LED on a Gigabyte GTX 970 G1 Gaming.
+
+The nouveau driver exposes the logo as a standard kernel LED
+(/sys/class/leds/nvidia-logo). This tool drives that LED: fixed brightness,
+or one of the kernel's LED triggers for effects, so no daemon has to stay
+running. The chosen mode is saved and re-applied at boot by the udev rule.
+"""
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+LED = Path(os.environ.get("GPU_LOGO_LED", "/sys/class/leds/nvidia-logo"))
+STATE = Path(os.environ.get("GPU_LOGO_STATE", "/var/lib/gpu-logo/state.json"))
+GROUP = "plugdev"
+# Attributes the udev hook hands to GROUP. The trigger-specific ones only exist
+# while their trigger is active.
+ATTRS = ("brightness", "trigger", "pattern", "repeat", "delay_on", "delay_off", "invert")
+
+# mode -> (kernel trigger, module that provides it or None if built in)
+TRIGGER_MODES = {
+    "heartbeat": ("heartbeat", "ledtrig-heartbeat"),
+    "activity": ("activity", "ledtrig-activity"),
+    "disk": ("disk-activity", None),
+}
+BREATHE_STEPS = 12  # pattern points per half cycle
+GAMMA = 2.2  # PWM duty is linear but perceived brightness is not
+
+
+class Fail(Exception):
+    pass
+
+
+def pct_to_raw(pct: int) -> int:
+    return round(pct * max_brightness() / 100)
+
+
+def max_brightness() -> int:
+    return int((LED / "max_brightness").read_text())
+
+
+def write_attr(name: str, value: str, wait: float = 0.0) -> None:
+    """Write a sysfs attribute, optionally waiting for it to become writable.
+
+    After a trigger is set the kernel creates its attributes root-only and the
+    udev hook regroups them a moment later, hence the wait.
+    """
+    path = LED / name
+    deadline = time.monotonic() + wait
+    while True:
+        try:
+            path.write_text(f"{value}\n")
+            return
+        except (FileNotFoundError, PermissionError) as e:
+            if time.monotonic() >= deadline:
+                hint = "" if os.geteuid() == 0 else " (run install.sh, or use sudo)"
+                raise Fail(f"cannot write {path}: {e.strerror}{hint}") from e
+            time.sleep(0.05)
+
+
+def read_trigger() -> tuple[str, list[str]]:
+    """Return (active trigger, all available triggers)."""
+    names = (LED / "trigger").read_text().split()
+    active = next((n[1:-1] for n in names if n.startswith("[")), "none")
+    return active, [n.strip("[]") for n in names]
+
+
+def set_trigger(name: str, module: str | None = None) -> None:
+    _, available = read_trigger()
+    if name not in available and module:
+        if os.geteuid() == 0:
+            subprocess.run(["modprobe", "-q", module], check=False)
+        else:
+            raise Fail(f"LED trigger '{name}' is not loaded; run: sudo modprobe {module}")
+    write_attr("trigger", name)
+
+
+def breathe_pattern(period_ms: int, lo: int, hi: int) -> str:
+    """Gamma-eased ramp lo -> hi -> lo as '<brightness> <duration_ms> ...' tuples.
+
+    The pattern trigger interpolates linearly between consecutive points.
+    """
+    step_ms = max(period_ms // (2 * BREATHE_STEPS), 1)
+    up = [round(lo + (hi - lo) * (i / BREATHE_STEPS) ** GAMMA) for i in range(BREATHE_STEPS + 1)]
+    points = up[:-1] + up[:0:-1]  # rise, then fall; the repeat wraps back to up[0]
+    return " ".join(f"{b} {step_ms}" for b in points)
+
+
+def normalize(raw: dict) -> dict:
+    """Validate a mode description (from the command line or the saved file).
+
+    The saved file is group-writable and is applied as root at boot, so nothing
+    from it reaches sysfs without passing through here.
+    """
+    def num(key: str, default: int, lo: int, hi: int) -> int:
+        v = raw.get(key, default)
+        if isinstance(v, bool) or not isinstance(v, int) or not lo <= v <= hi:
+            raise Fail(f"{key} must be an integer from {lo} to {hi}")
+        return v
+
+    mode = raw.get("mode")
+    if mode == "static":
+        return {"mode": mode, "level": num("level", 100, 0, 100)}
+    if mode == "breathe":
+        s = {"mode": mode, "period_ms": num("period_ms", 4000, 200, 600000),
+             "min": num("min", 0, 0, 100), "max": num("max", 100, 0, 100)}
+        if s["min"] >= s["max"]:
+            raise Fail("min must be lower than max")
+        return s
+    if mode == "blink":
+        return {"mode": mode, "on_ms": num("on_ms", 500, 10, 600000),
+                "off_ms": num("off_ms", 500, 10, 600000), "level": num("level", 100, 1, 100)}
+    if mode in TRIGGER_MODES:
+        return {"mode": mode}
+    raise Fail(f"unknown mode: {mode!r}")
+
+
+def apply(state: dict) -> None:
+    mode = state["mode"]
+    # Always drop the old trigger first: writing brightness 0 under an active
+    # trigger would remove it anyway, and this gives every mode a clean start.
+    write_attr("trigger", "none")
+    if mode == "static":
+        write_attr("brightness", pct_to_raw(state["level"]))
+    elif mode == "breathe":
+        set_trigger("pattern", "ledtrig-pattern")
+        pattern = breathe_pattern(state["period_ms"], pct_to_raw(state["min"]), pct_to_raw(state["max"]))
+        write_attr("pattern", pattern, wait=3.0)
+    elif mode == "blink":
+        # The timer trigger blinks at whatever brightness was set when it started.
+        write_attr("brightness", pct_to_raw(state["level"]))
+        set_trigger("timer", "ledtrig-timer")
+        write_attr("delay_on", state["on_ms"], wait=3.0)
+        write_attr("delay_off", state["off_ms"], wait=3.0)
+    else:
+        set_trigger(*TRIGGER_MODES[mode])
+
+
+def save(state: dict) -> None:
+    try:
+        tmp = STATE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(state) + "\n")
+        os.replace(tmp, STATE)
+    except OSError as e:
+        print(f"note: applied, but could not save for next boot ({STATE}: {e.strerror})", file=sys.stderr)
+
+
+def load_saved() -> dict | None:
+    try:
+        return normalize(json.loads(STATE.read_text()))
+    except FileNotFoundError:
+        return None
+    except (ValueError, AttributeError, Fail) as e:
+        raise Fail(f"ignoring invalid {STATE}: {e}") from e
+
+
+def udev_hook() -> None:
+    """Run as root by the udev rule on add/change events for the LED."""
+    for attr in ATTRS:
+        path = LED / attr
+        if path.exists():
+            shutil.chown(path, group=GROUP)
+            path.chmod(0o664)
+    # Only on "add": applying a mode sets a trigger, which emits a "change"
+    # event, and restoring on that too would loop.
+    if os.environ.get("ACTION") == "add":
+        state = load_saved()
+        if state:
+            apply(state)
+
+
+def status() -> None:
+    active, _ = read_trigger()
+    raw = int((LED / "brightness").read_text())
+    print(f"led:        {LED}")
+    print(f"trigger:    {active}")
+    print(f"brightness: {raw}/{max_brightness()} ({round(raw * 100 / max_brightness())}%)")
+    try:
+        saved = load_saved()
+    except Fail as e:
+        saved = str(e)
+    print(f"saved mode: {json.dumps(saved) if isinstance(saved, dict) else saved or 'none (card default: full brightness)'}")
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(prog="gpu-logo", description="Control the GPU's WINDFORCE logo LED.")
+    p.add_argument("--no-save", action="store_true", help="do not remember this mode for the next boot")
+    sub = p.add_subparsers(dest="cmd", required=True, metavar="command")
+    sub.add_parser("status", help="show current and saved state")
+    sub.add_parser("on", help="full brightness")
+    sub.add_parser("off", help="turn the logo off")
+    s = sub.add_parser("set", help="fixed brightness")
+    s.add_argument("level", type=int, metavar="PERCENT", help="0-100")
+    s = sub.add_parser("breathe", help="fade in and out")
+    s.add_argument("--period", type=float, default=4.0, metavar="SEC", help="seconds per cycle (default 4)")
+    s.add_argument("--min", type=int, default=0, metavar="PERCENT")
+    s.add_argument("--max", type=int, default=100, metavar="PERCENT")
+    s = sub.add_parser("blink", help="flash on and off")
+    s.add_argument("--on", type=int, default=500, metavar="MS", dest="on_ms")
+    s.add_argument("--off", type=int, default=500, metavar="MS", dest="off_ms")
+    s.add_argument("--level", type=int, default=100, metavar="PERCENT")
+    sub.add_parser("heartbeat", help="double-pulse that speeds up with system load")
+    sub.add_parser("activity", help="CPU load meter: faint slow flashes when idle, fast and bright when busy")
+    sub.add_parser("disk", help="flicker on disk activity")
+    sub.add_parser("restore", help="re-apply the saved mode")
+    sub.add_parser("udev-hook")  # internal, run by the udev rule; no help= keeps it out of --help
+    a = p.parse_args()
+
+    try:
+        if not LED.exists():
+            raise Fail(f"{LED} not found: is the card running on the nouveau driver?")
+        if a.cmd == "status":
+            return status()
+        if a.cmd == "udev-hook":
+            return udev_hook()
+        if a.cmd == "restore":
+            state = load_saved()
+            if not state:
+                raise Fail("no saved mode")
+            return apply(state)
+
+        if a.cmd in ("on", "off"):
+            raw = {"mode": "static", "level": 100 if a.cmd == "on" else 0}
+        elif a.cmd == "set":
+            raw = {"mode": "static", "level": a.level}
+        elif a.cmd == "breathe":
+            raw = {"mode": "breathe", "period_ms": round(a.period * 1000), "min": a.min, "max": a.max}
+        elif a.cmd == "blink":
+            raw = {"mode": "blink", "on_ms": a.on_ms, "off_ms": a.off_ms, "level": a.level}
+        else:
+            raw = {"mode": a.cmd}
+        state = normalize(raw)
+        apply(state)
+        if not a.no_save:
+            save(state)
+    except Fail as e:
+        sys.exit(f"gpu-logo: {e}")
+
+
+if __name__ == "__main__":
+    main()

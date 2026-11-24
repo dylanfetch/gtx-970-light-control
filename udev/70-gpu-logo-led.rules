@@ -1,0 +1,5 @@
+# Logo LED on a Gigabyte GTX 970 G1 Gaming, exposed by nouveau as "nvidia-logo".
+# The hook lets the plugdev group write the LED's sysfs attributes (the kernel
+# creates them root-only, including the ones each trigger adds) and, when the
+# device first appears, re-applies the mode saved by `gpu-logo`.
+ACTION=="add|change", SUBSYSTEM=="leds", KERNEL=="nvidia-logo", RUN+="/usr/local/bin/gpu-logo udev-hook"
