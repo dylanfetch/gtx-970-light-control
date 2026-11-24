@@ -164,7 +164,7 @@ class HeartbeatTest(GpuLogoTest):
     def test_calm_is_slow_and_soft_and_flat_out_is_fast_and_strong(self):
         calm, calm_ms = self.shape(0.0)
         hard, hard_ms = self.shape(1.0)
-        self.assertEqual((calm_ms, hard_ms), self.g.BEAT_PERIOD_MS)
+        self.assertEqual((calm_ms, hard_ms), (3000, 1000))  # 20 and 60 beats a minute
         self.assertEqual(max(hard), 255)
         self.assertTrue(max(calm) < 60)
         self.assertTrue(min(calm) > 0)  # a glow remains between beats

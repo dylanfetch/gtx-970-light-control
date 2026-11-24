@@ -62,12 +62,12 @@ What the agent did with it, in order:
    six-minute test fade stepped 238, 189, 136, 91, 56, 29, one step a minute.
 8. **Reworked the CPU indicator.** The kernel's built-in one flashes, and on a
    desk it read as a strobe. At the owner's suggestion it became a heartbeat,
-   like an athlete's: slow and soft at rest, fast and hard under load. Calm,
-   then flat out:
+   like an athlete's: slow and soft at rest, faster and harder under load.
+   Eight seconds each of calm and flat out, 15 characters a second:
 
    ```
-   calm       **********************%%%@@%%##%##%%#%##**********************#%@@@@#####%##%###**********************#%#@@%%%##
-   flat out   -*@@**+*##**---------*@@%****#*---------*@@%++**##*--------:#@@**+*##*+---------*@@#***##*+-:-------*@@*++**#*+-
+   calm       *####*************************************#@@######*************************************#@@######***********************
+   flat out   -=@**#*----------@%+##----------*@**#+---------=@**#*----------@@+##----------*@+*#*---------=@**#*----------%@+##------
    ```
 
 ## Using it
@@ -112,13 +112,16 @@ logo keeps a faint glow between beats, so it swells rather than flashes.
 
 | | Calm | Flat out |
 | --- | --- | --- |
-| Pace | 46 beats a minute | 92 beats a minute |
+| Pace | 20 beats a minute | 60 beats a minute |
 | Strength | a gentle swell, to about 15% | full brightness |
 
 It follows total CPU use across every logical core, sampled every two seconds
 and smoothed over about ten, so a brief spike barely registers and sustained
 work brings the pace up gradually. Pace and strength move in nine steps, and
 each change waits for the rest between beats, so the rhythm never jumps.
+
+Most of the change in pace is in the rest: the beat itself only tightens from
+0.7 to 0.45 seconds, while the gap after it shrinks from 2.3 seconds to 0.55.
 
 The numbers that set the feel are named constants at the top of `gpu-logo`.
 

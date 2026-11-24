@@ -37,7 +37,7 @@ TICK_MS = 50  # the kernel's pattern trigger redraws a fade every 50 ms
 SYNC_WAIT_S = 5.0  # longest to wait for a running pattern to reach its resting level
 
 # The cpu mode's heartbeat, as (calm, flat out). Tune the feel here.
-BEAT_PERIOD_MS = (1300, 650)  # 46 to 92 beats a minute
+BEAT_BPM = (20, 60)
 BEAT_PEAK = (0.42, 1.0)  # perceived brightness of the main beat
 BEAT_BASE_PCT = (3, 8)  # glow between beats, so the logo never goes dark
 BEAT_RISE_MS = (150, 100)
@@ -161,7 +161,7 @@ def heartbeat_pattern(effort: float, dim: float = 1.0) -> str | None:
     dip = base + round((peak - base) * 0.3)  # between the two beats
     dub = base + round((peak - base) * 0.6)  # the second, weaker beat
     rise, fall, settle = (whole_ticks(between(p)) for p in (BEAT_RISE_MS, BEAT_FALL_MS, BEAT_SETTLE_MS))
-    rest = max(whole_ticks(between(BEAT_PERIOD_MS)) - (2 * rise + fall + settle), 2 * TICK_MS)
+    rest = max(whole_ticks(60000 / between(BEAT_BPM)) - (2 * rise + fall + settle), 2 * TICK_MS)
     return " ".join([fade(base, rise), fade(peak, fall), fade(dip, rise), fade(dub, settle),
                      f"{base} {rest}"])  # same level as the first tuple, so this one just waits
 
