@@ -6,19 +6,23 @@ GPU's logo PWM output. Whether that device exists decides what you do here.
 
 ## Setting it up on someone's machine
 
+Your human is your eyes. Wherever a step says to ask them, tell them what you
+just did and ask what the light is doing.
+
 1. **Find the device.** `ls /sys/class/leds/nvidia-logo`. If it is missing, go to
    [No nvidia-logo device](#no-nvidia-logo-device) and stop there.
-2. **Prove it is the light your human means, before installing anything.** As
-   root, write `0` and then `255` to `brightness`. Done when a person or a
-   camera has seen the light go dark and come back. sysfs reads back whatever
-   was written, so reading it proves nothing about the light.
+2. **Confirm it is the light your human means, before installing anything.** As
+   root, write `0` to `brightness` and ask whether the light went out, then
+   write `255` and ask whether it came back. Done when they have said yes to
+   both. sysfs reads back whatever was written, so reading it proves nothing
+   about the light.
 3. **Check the group.** `gpu-logo` grants LED access to `plugdev`. If
    `id -nG` lacks it, either add the user (takes effect at next login) or change
    `GROUP` in `gpu-logo` to a group they are in.
 4. **Install.** `sudo ./install.sh`. Ask your human for the sudo password.
-5. **Verify as the normal user.** `gpu-logo off`, `gpu-logo on`,
-   `gpu-logo breathe`, each without sudo. Done when each one has been seen to
-   change the light.
+5. **Verify as the normal user.** Run `gpu-logo off`, `gpu-logo on` and
+   `gpu-logo breathe`, each without sudo, asking after each one. Done when your
+   human has confirmed all three.
 6. **Ask what they want.** A mode (`gpu-logo --help`), and whether to dim at
    night. Schedule times are read on the system clock, which is often UTC on a
    machine nobody set up by hand: check `timedatectl` and pass `--tz` with the
@@ -39,12 +43,14 @@ GPU's logo PWM output. Whether that device exists decides what you do here.
   in the README still applies: find out what software used to control the
   light, and that tells you which mechanism the card uses.
 
-## Verifying with a camera
+## Optional: a camera instead of asking
 
-`tools/observe.py` counts lit pixels in the logo's region of a webcam frame, and
-`--series SECONDS` samples over time to show an effect's shape. Its `ROI` is for
-one particular camera placement. To find yours, capture a frame at brightness
-255 and another at 0 and take the bounding box of what changed.
+If a webcam happens to be pointed at the card, `tools/observe.py` can answer
+the "what is the light doing" questions for you. It counts lit pixels in the
+logo's region of a frame, and `--series SECONDS` samples over time to show an
+effect's shape. Its `ROI` is for one particular camera placement. To find
+yours, capture a frame at brightness 255 and another at 0 and take the bounding
+box of what changed.
 
 ## Changing the code
 
@@ -52,7 +58,7 @@ one particular camera placement. To find yours, capture a frame at brightness
   after `sudo ./install.sh`.
 - `python3 -m unittest discover tests` covers the logic with a fake LED
   directory. It cannot tell you what the light did; for anything that touches
-  the LED, observe it.
+  the LED, ask your human or use the camera.
 - LED behaviour that is easy to get wrong. `gpu-logo` handles the first four,
   with a comment at each spot:
   - Writing `0` to `brightness` while a trigger is active removes the trigger.

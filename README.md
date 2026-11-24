@@ -53,9 +53,15 @@ What the agent did with it, in order:
 
    The camera also caught a mode that did nothing. A "cpu" effect ran without
    error, but the logo never changed, so it was replaced with one that works.
-
-The human's part: aiming the webcam, typing a sudo password, and asking for the
-night schedule afterwards.
+7. **Added night dimming when asked for it.** The request was for something
+   like a screen dimmer, so the schedule scales whatever mode is showing
+   instead of replacing it: a breathing logo keeps breathing, just fainter.
+   Two things surfaced along the way. The machine's clock turned out to be on
+   UTC, which would have put every time hours off, so a schedule carries its
+   own timezone. And some effects ignore the LED's brightness and flash at a
+   level left over from whatever ran before, so that level is now set
+   explicitly. On the card, every mode came out fainter under a 20% schedule,
+   and a six-minute fade stepped 238, 189, 136, 91, 56, 29, one step a minute.
 
 ## Using it
 
@@ -77,13 +83,12 @@ the command to try something without remembering it.
 ### Night dimming
 
 ```
-gpu-logo schedule --from 01:30 --to 08:30 --level 10 --fade 30 --tz America/New_York
+gpu-logo schedule --from 23:30 --to 08:30 --level 10 --fade 30 --tz America/New_York
 gpu-logo schedule            # show the schedule and what it is doing right now
 gpu-logo schedule --off      # remove it
 ```
 
-Like a screen dimmer, this scales whatever mode is showing rather than
-replacing it: a breathing logo keeps breathing, just fainter.
+This scales whatever mode is showing rather than replacing it.
 
 | Option | Meaning |
 | --- | --- |
@@ -104,12 +109,14 @@ number, total CPU use across every logical core, by how the logo flashes:
 | Beyond that | 10 flashes per second, each one longer, until the logo is lit 90% of the time with every core busy |
 
 It never goes fully steady, so a hung machine looks different from an idle or a
-saturated one. It cannot show cores individually: there is one LED.
+saturated one. It cannot show cores individually: there is one LED. Be warned
+that on a lightly loaded desktop it reads as a strobe.
 
 ## Setting it up
 
 Hand it to your agent: [AGENTS.md](AGENTS.md) tells it how to check whether your
-card qualifies, install, and prove the light responds.
+card qualifies, install, and confirm with you that the light responds. No
+webcam is needed; it will ask you what the light is doing.
 
 By hand: `sudo ./install.sh`, and `sudo ./uninstall.sh` to remove everything.
 It needs the nouveau driver, systemd, Python 3.10 or newer, and membership of
@@ -127,7 +134,7 @@ that nouveau provides.
 | `systemd/gpu-logo-schedule.timer` | Runs `gpu-logo tick` once a minute. It does nothing unless a schedule is set and the brightness it calls for has changed. |
 | `modules-load.d/gpu-logo.conf` | Loads the trigger modules at boot. |
 | `/var/lib/gpu-logo/` | The saved mode, the schedule, and a note of what was last applied. Group-writable, so everything read from it is validated strictly before root acts on it. |
-| `tools/observe.py` | Measures the logo through a webcam, to confirm a command changed the real light. |
+| `tools/observe.py` | Optional. Measures the logo through a webcam, to confirm a command changed the real light. |
 | `tests/` | Schedule arithmetic, input validation and mode logic against a fake LED directory: `python3 -m unittest discover tests` |
 
 ## What was verified
