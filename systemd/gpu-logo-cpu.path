@@ -1,0 +1,10 @@
+[Unit]
+Description=Start the gpu-logo CPU heartbeat when the mode changes
+
+[Path]
+# gpu-logo replaces files in this directory whenever it changes the LED.
+PathChanged=/var/lib/gpu-logo
+Unit=gpu-logo-cpu.service
+
+[Install]
+WantedBy=paths.target

@@ -59,15 +59,25 @@ box of what changed.
 - `python3 -m unittest discover tests` covers the logic with a fake LED
   directory. It cannot tell you what the light did; for anything that touches
   the LED, ask your human or use the camera.
-- LED behaviour that is easy to get wrong. `gpu-logo` handles the first four,
-  with a comment at each spot:
+- LED behaviour that is easy to get wrong. `gpu-logo` handles each of these,
+  with a comment at the spot:
   - Writing `0` to `brightness` while a trigger is active removes the trigger.
   - A trigger's own attributes (`pattern`, `delay_on`, ...) are created
     root-only every time the trigger is set. The udev hook regroups them on the
     resulting `change` event, so an unprivileged write has to wait for that.
   - Restoring the saved mode sets a trigger, which emits `change`. Restore on
     `add` only.
-  - `heartbeat`, `activity` and `disk-activity` flash at the LED's remembered
-    blink brightness, left over from the previous effect. Set it explicitly.
-  - The kernel's `cpu` trigger accepts being selected and then never varies on
-    this hardware.
+  - `disk-activity` (like the kernel's `heartbeat` and `activity` triggers)
+    flashes at the LED's remembered blink brightness, left over from the
+    previous effect. Set it explicitly.
+  - The `pattern` trigger redraws a fade every 50 ms and spends one extra
+    redraw on each fading tuple, so a tuple written as 100 ms lasts 150.
+  - Writing `pattern` restarts it from its first tuple. To change a running
+    pattern without a visible jump, wait until `brightness` reads the
+    pattern's resting level. The driver reads that back from hardware and can
+    return one count less than was written.
+- The kernel's `cpu` trigger accepts being selected and then never varies on
+  this hardware, and its `activity` trigger reads as a strobe. The `cpu` mode
+  here draws its own heartbeat instead.
+- `gpu-logo cpu-daemon` must check that its mode is still showing immediately
+  before every write. It once overwrote the mode that had replaced it.

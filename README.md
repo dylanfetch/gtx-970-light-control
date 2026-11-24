@@ -27,8 +27,8 @@ What the agent did with it, in order:
 2. **Chased the obvious idea, and dropped it.** Newer Gigabyte cards have an RGB
    controller chip on an I2C bus, and tools such as OpenRGB talk to it. Searching
    turned up no such thing for this card. It turned up something better: reviews
-   from the card's era saying the logo was controlled by the LED Visualizer in NVIDIA's
-   GeForce Experience, and that it was blue only.
+   from the card's era saying the logo was controlled by the LED Visualizer in
+   NVIDIA's GeForce Experience, and that it was blue only.
 3. **Followed what that implied.** If NVIDIA's own software drove the light, the
    card must use NVIDIA's reference logo-LED output, the one behind the GEFORCE
    GTX logo on reference cards. nouveau has a driver for that output. One `ls`
@@ -46,22 +46,29 @@ What the agent did with it, in order:
    character per video frame:
 
    ```
-   breathe    %@@@@@@@@@@@@%%%%%%######**********++++++===========------------:::                 .:::::---------------=========++=++
+   breathe    :::--------=======++++++*******#####%%%%%%%@@@@@@@@@@@%%%%%#####******++++++=+======-------:-::::::.            ::::
    blink      -%@@@@@@@@@@@@@@               #@@@@@@@@@@@@@@-              #@@@@@@@@@@@@@@*              *@@@@@@@@@@@@@@%
-   heartbeat      *@@ -#@          +%% -#@:         +%% =%@-         =%% -#@          =%% -#@          +%@ :#@-         =@%  #@=
    ```
 
-   The camera also caught a mode that did nothing. A "cpu" effect ran without
-   error, but the logo never changed, so it was replaced with one that works.
+   The camera caught what reading the settings back could not: an early load
+   indicator that ran without error and never changed the logo, and a
+   background service that overwrote the breathing effect with one last frame
+   of its own after another mode had taken over.
 7. **Added night dimming when asked for it.** The request was for something
    like a screen dimmer, so the schedule scales whatever mode is showing
    instead of replacing it: a breathing logo keeps breathing, just fainter.
-   Two things surfaced along the way. The machine's clock turned out to be on
-   UTC, which would have put every time hours off, so a schedule carries its
-   own timezone. And some effects ignore the LED's brightness and flash at a
-   level left over from whatever ran before, so that level is now set
-   explicitly. On the card, every mode came out fainter under a 20% schedule,
-   and a six-minute fade stepped 238, 189, 136, 91, 56, 29, one step a minute.
+   The machine's clock turned out to be on UTC, which would have put every
+   time hours off, so a schedule carries its own timezone. On the card, a
+   six-minute test fade stepped 238, 189, 136, 91, 56, 29, one step a minute.
+8. **Reworked the CPU indicator.** The kernel's built-in one flashes, and on a
+   desk it read as a strobe. At the owner's suggestion it became a heartbeat,
+   like an athlete's: slow and soft at rest, fast and hard under load. Calm,
+   then flat out:
+
+   ```
+   calm       **********************%%%@@%%##%##%%#%##**********************#%@@@@#####%##%###**********************#%#@@%%%##
+   flat out   -*@@**+*##**---------*@@%****#*---------*@@%++**##*--------:#@@**+*##*+---------*@@#***##*+-:-------*@@*++**#*+-
+   ```
 
 ## Using it
 
@@ -71,8 +78,7 @@ gpu-logo on                  # full brightness
 gpu-logo set 30              # fixed brightness, percent
 gpu-logo breathe             # fade in and out (--period SEC, --min/--max PERCENT)
 gpu-logo blink               # flash (--on MS, --off MS, --level PERCENT)
-gpu-logo heartbeat           # double pulse, faster under load
-gpu-logo activity            # CPU load meter (see below)
+gpu-logo cpu                 # heartbeat that follows CPU load (see below)
 gpu-logo disk                # flicker on disk activity
 gpu-logo status
 ```
@@ -83,34 +89,38 @@ the command to try something without remembering it.
 ### Night dimming
 
 ```
-gpu-logo schedule --from 23:30 --to 08:30 --level 10 --fade 30 --tz America/New_York
+gpu-logo schedule --dim 23:30-02:00 --brighten 08:30-09:00 --level 10 --tz America/New_York
 gpu-logo schedule            # show the schedule and what it is doing right now
 gpu-logo schedule --off      # remove it
 ```
 
-This scales whatever mode is showing rather than replacing it.
+That example starts dimming at 23:30, reaches 10% at 02:00, stays there until
+08:30, and is back to normal by 09:00. It scales whatever mode is showing
+rather than replacing it.
 
 | Option | Meaning |
 | --- | --- |
-| `--from`, `--to` | When dimming begins and when brightening begins, 24-hour. The period may cross midnight. |
+| `--dim` | `START-END` fades down gradually between the two times; a single time switches at once. 24-hour, and the span may cross midnight. |
+| `--brighten` | The same, for returning to normal. |
 | `--level` | Brightness while dimmed, as a percent of normal. `0` turns the logo off. Default 10. |
-| `--fade` | Minutes each transition takes, starting at the given time. `0` switches instantly. Default 30. |
 | `--tz` | Timezone the times are in. Defaults to the system clock's, which on a server is often UTC; `gpu-logo schedule` prints the time it is working from. |
 
-### The CPU load meter
+### The CPU heartbeat
 
-`gpu-logo activity` uses the kernel's `activity` LED trigger. It shows one
-number, total CPU use across every logical core, by how the logo flashes:
+`gpu-logo cpu` beats like a heart: a strong pulse, a weaker one, a rest. The
+logo keeps a faint glow between beats, so it swells rather than flashes.
 
-| Load | What the logo does |
-| --- | --- |
-| Idle | A 10 ms blip once a second |
-| Up to one core's worth | Same short blip, coming faster, up to 10 per second |
-| Beyond that | 10 flashes per second, each one longer, until the logo is lit 90% of the time with every core busy |
+| | Calm | Flat out |
+| --- | --- | --- |
+| Pace | 46 beats a minute | 92 beats a minute |
+| Strength | a gentle swell, to about 15% | full brightness |
 
-It never goes fully steady, so a hung machine looks different from an idle or a
-saturated one. It cannot show cores individually: there is one LED. Be warned
-that on a lightly loaded desktop it reads as a strobe.
+It follows total CPU use across every logical core, sampled every two seconds
+and smoothed over about ten, so a brief spike barely registers and sustained
+work brings the pace up gradually. Pace and strength move in nine steps, and
+each change waits for the rest between beats, so the rhythm never jumps.
+
+The numbers that set the feel are named constants at the top of `gpu-logo`.
 
 ## Setting it up
 
@@ -129,13 +139,14 @@ that nouveau provides.
 
 | Piece | Role |
 | --- | --- |
-| `gpu-logo` | CLI. Fixed levels write `brightness`; effects select a kernel LED trigger (`pattern`, `timer`, `heartbeat`, `activity`, `disk-activity`), so nothing stays running in the background. |
+| `gpu-logo` | CLI. Fixed levels write `brightness`; effects hand a pattern to a kernel LED trigger, which draws it. Nothing of this tool's stays running, except while the cpu mode is showing. |
 | `udev/70-gpu-logo-led.rules` | Runs `gpu-logo udev-hook` as root when the LED appears or changes: gives group `plugdev` write access to the LED's attributes, and on first appearance re-applies the saved mode. |
 | `systemd/gpu-logo-schedule.timer` | Runs `gpu-logo tick` once a minute. It does nothing unless a schedule is set and the brightness it calls for has changed. |
+| `systemd/gpu-logo-cpu.path`, `.service` | Start the heartbeat's load sampler when the saved state changes. It exits at once unless the cpu mode is showing, and exits when another mode replaces it. |
 | `modules-load.d/gpu-logo.conf` | Loads the trigger modules at boot. |
 | `/var/lib/gpu-logo/` | The saved mode, the schedule, and a note of what was last applied. Group-writable, so everything read from it is validated strictly before root acts on it. |
 | `tools/observe.py` | Optional. Measures the logo through a webcam, to confirm a command changed the real light. |
-| `tests/` | Schedule arithmetic, input validation and mode logic against a fake LED directory: `python3 -m unittest discover tests` |
+| `tests/` | Schedule arithmetic, input validation, pattern shapes and mode logic against a fake LED directory: `python3 -m unittest discover tests` |
 
 ## What was verified
 
@@ -143,11 +154,15 @@ On Ubuntu 24.04 (kernel 6.8, nouveau), by counting lit pixels in the logo
 region of the webcam image:
 
 - off, and brightness 16 / 64 / 128 / 255, each produced a distinct level
-- breathe, blink, heartbeat, activity (idle and with all cores busy) and disk
-  each showed the expected pattern over time
-- every mode was visibly fainter under a 20% schedule
-- the timer stepped a fade down minute by minute
+- breathe, blink and disk each showed the expected pattern over time, and
+  breathe kept its 4-second period
+- the heartbeat at calm, half and full effort, and its pace following real
+  load
+- modes came out fainter under a schedule, and the timer stepped a fade down
+  minute by minute
+- switching modes quickly, including into and out of the heartbeat
 - the boot-time restore, by replaying the device's udev `add` event
+- uninstall followed by install
 
 Not tested: an actual reboot, and suspend/resume.
 
