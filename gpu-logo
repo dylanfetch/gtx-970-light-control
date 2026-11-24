@@ -4,19 +4,27 @@
 The nouveau driver exposes the logo as a standard kernel LED
 (/sys/class/leds/nvidia-logo). This tool drives that LED: fixed brightness,
 or one of the kernel's LED triggers for effects, so no daemon has to stay
-running. The chosen mode is saved and re-applied at boot by the udev rule.
+running. The chosen mode is saved and re-applied at boot by the udev rule,
+and an optional schedule dims whatever mode is showing at night.
 """
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
+import zoneinfo
+from datetime import datetime
 from pathlib import Path
 
 LED = Path(os.environ.get("GPU_LOGO_LED", "/sys/class/leds/nvidia-logo"))
-STATE = Path(os.environ.get("GPU_LOGO_STATE", "/var/lib/gpu-logo/state.json"))
+STATE_DIR = Path(os.environ.get("GPU_LOGO_STATE_DIR", "/var/lib/gpu-logo"))
+MODE_FILE = STATE_DIR / "state.json"  # mode to show, restored at boot
+SCHEDULE_FILE = STATE_DIR / "schedule.json"  # night dimming, if any
+APPLIED_FILE = STATE_DIR / "applied.json"  # what was last written to the LED
 GROUP = "plugdev"
 # Attributes the udev hook hands to GROUP. The trigger-specific ones only exist
 # while their trigger is active.
@@ -28,23 +36,30 @@ TRIGGER_MODES = {
     "activity": ("activity", "ledtrig-activity"),
     "disk": ("disk-activity", None),
 }
+DEFAULT_MODE = {"mode": "static", "level": 100}  # what the card does on its own
 BREATHE_STEPS = 12  # pattern points per half cycle
 GAMMA = 2.2  # PWM duty is linear but perceived brightness is not
+DAY_MIN = 24 * 60
 
 
 class Fail(Exception):
     pass
 
 
-def pct_to_raw(pct: int) -> int:
-    return round(pct * max_brightness() / 100)
-
+# --- sysfs -------------------------------------------------------------------
 
 def max_brightness() -> int:
     return int((LED / "max_brightness").read_text())
 
 
-def write_attr(name: str, value: str, wait: float = 0.0) -> None:
+def to_raw(pct: float, dim: float = 1.0) -> int:
+    """Percent of full brightness, scaled by the schedule's dim factor, as a PWM value."""
+    raw = round(pct * dim * max_brightness() / 100)
+    # Dimming should make a lit logo faint, never round it away to off.
+    return max(raw, 1) if pct > 0 and dim > 0 else raw
+
+
+def write_attr(name: str, value: object, wait: float = 0.0) -> None:
     """Write a sysfs attribute, optionally waiting for it to become writable.
 
     After a trigger is set the kernel creates its attributes root-only and the
@@ -80,6 +95,40 @@ def set_trigger(name: str, module: str | None = None) -> None:
     write_attr("trigger", name)
 
 
+# --- modes -------------------------------------------------------------------
+
+def _int(raw: dict, key: str, default: int | None, lo: int, hi: int) -> int:
+    v = raw.get(key, default)
+    if isinstance(v, bool) or not isinstance(v, int) or not lo <= v <= hi:
+        raise Fail(f"{key} must be an integer from {lo} to {hi}")
+    return v
+
+
+def normalize(raw: object) -> dict:
+    """Validate a mode description (from the command line or a saved file).
+
+    The saved files are group-writable and are applied as root, so nothing from
+    them reaches sysfs without passing through here.
+    """
+    if not isinstance(raw, dict):
+        raise Fail("mode must be a JSON object")
+    mode = raw.get("mode")
+    if mode == "static":
+        return {"mode": mode, "level": _int(raw, "level", 100, 0, 100)}
+    if mode == "breathe":
+        s = {"mode": mode, "period_ms": _int(raw, "period_ms", 4000, 200, 600000),
+             "min": _int(raw, "min", 0, 0, 100), "max": _int(raw, "max", 100, 0, 100)}
+        if s["min"] >= s["max"]:
+            raise Fail("min must be lower than max")
+        return s
+    if mode == "blink":
+        return {"mode": mode, "on_ms": _int(raw, "on_ms", 500, 10, 600000),
+                "off_ms": _int(raw, "off_ms", 500, 10, 600000), "level": _int(raw, "level", 100, 1, 100)}
+    if mode in TRIGGER_MODES:
+        return {"mode": mode}
+    raise Fail(f"unknown mode: {mode!r}")
+
+
 def breathe_pattern(period_ms: int, lo: int, hi: int) -> str:
     """Gamma-eased ramp lo -> hi -> lo as '<brightness> <duration_ms> ...' tuples.
 
@@ -91,73 +140,193 @@ def breathe_pattern(period_ms: int, lo: int, hi: int) -> str:
     return " ".join(f"{b} {step_ms}" for b in points)
 
 
-def normalize(raw: dict) -> dict:
-    """Validate a mode description (from the command line or the saved file).
-
-    The saved file is group-writable and is applied as root at boot, so nothing
-    from it reaches sysfs without passing through here.
-    """
-    def num(key: str, default: int, lo: int, hi: int) -> int:
-        v = raw.get(key, default)
-        if isinstance(v, bool) or not isinstance(v, int) or not lo <= v <= hi:
-            raise Fail(f"{key} must be an integer from {lo} to {hi}")
-        return v
-
-    mode = raw.get("mode")
-    if mode == "static":
-        return {"mode": mode, "level": num("level", 100, 0, 100)}
-    if mode == "breathe":
-        s = {"mode": mode, "period_ms": num("period_ms", 4000, 200, 600000),
-             "min": num("min", 0, 0, 100), "max": num("max", 100, 0, 100)}
-        if s["min"] >= s["max"]:
-            raise Fail("min must be lower than max")
-        return s
-    if mode == "blink":
-        return {"mode": mode, "on_ms": num("on_ms", 500, 10, 600000),
-                "off_ms": num("off_ms", 500, 10, 600000), "level": num("level", 100, 1, 100)}
-    if mode in TRIGGER_MODES:
-        return {"mode": mode}
-    raise Fail(f"unknown mode: {mode!r}")
-
-
-def apply(state: dict) -> None:
+def apply(state: dict, dim: float = 1.0) -> None:
+    """Show `state` on the LED, with every brightness scaled by `dim` (0..1)."""
     mode = state["mode"]
     # Always drop the old trigger first: writing brightness 0 under an active
     # trigger would remove it anyway, and this gives every mode a clean start.
     write_attr("trigger", "none")
-    if mode == "static":
-        write_attr("brightness", pct_to_raw(state["level"]))
-    elif mode == "breathe":
-        set_trigger("pattern", "ledtrig-pattern")
-        pattern = breathe_pattern(state["period_ms"], pct_to_raw(state["min"]), pct_to_raw(state["max"]))
-        write_attr("pattern", pattern, wait=3.0)
+
+    if mode == "breathe":
+        lo, hi = to_raw(state["min"], dim), to_raw(state["max"], dim)
+        if lo < hi:
+            set_trigger("pattern", "ledtrig-pattern")
+            write_attr("pattern", breathe_pattern(state["period_ms"], lo, hi), wait=3.0)
+        else:  # dimmed so far that there is no swing left
+            write_attr("brightness", hi)
+        return
+
+    level = to_raw(state.get("level", 100), dim)
+    if mode == "static" or level == 0:
+        write_attr("brightness", level)
     elif mode == "blink":
         # The timer trigger blinks at whatever brightness was set when it started.
-        write_attr("brightness", pct_to_raw(state["level"]))
+        write_attr("brightness", level)
         set_trigger("timer", "ledtrig-timer")
         write_attr("delay_on", state["on_ms"], wait=3.0)
         write_attr("delay_off", state["off_ms"], wait=3.0)
     else:
         set_trigger(*TRIGGER_MODES[mode])
+        # These triggers flash at the LED's remembered blink brightness, which
+        # is left over from whatever ran before. Writing brightness while one
+        # is active sets that level instead of the LED itself.
+        write_attr("brightness", level)
 
 
-def save(state: dict) -> None:
+# --- schedule ----------------------------------------------------------------
+
+def normalize_schedule(raw: object) -> dict:
+    if not isinstance(raw, dict):
+        raise Fail("schedule must be a JSON object")
+    s = {"start_min": _int(raw, "start_min", None, 0, DAY_MIN - 1),
+         "end_min": _int(raw, "end_min", None, 0, DAY_MIN - 1),
+         "level": _int(raw, "level", None, 0, 100),
+         "fade_min": _int(raw, "fade_min", 0, 0, DAY_MIN)}
+    night = (s["end_min"] - s["start_min"]) % DAY_MIN
+    if night == 0:
+        raise Fail("the dimmed period must start and end at different times")
+    # Each fade starts at its boundary and must finish before the next one.
+    if s["fade_min"] > min(night, DAY_MIN - night):
+        raise Fail(f"fade is longer than the shorter of the two periods ({min(night, DAY_MIN - night)} min)")
+    tz = raw.get("tz")
+    if tz is not None:
+        if not isinstance(tz, str) or tz not in zoneinfo.available_timezones():
+            raise Fail(f"unknown timezone {tz!r}; use a name like America/New_York")
+        s["tz"] = tz
+    return s
+
+
+def dim_at(s: dict, minute: float) -> float:
+    """Brightness factor (0..1) the schedule calls for at `minute` of the day.
+
+    Fading down begins at start_min, fading back up begins at end_min; each
+    takes fade_min minutes and follows a gamma curve so it looks even.
+    """
+    def ease(a: float, b: float, f: float) -> float:
+        ga, gb = a ** (1 / GAMMA), b ** (1 / GAMMA)
+        return (ga + (gb - ga) * f) ** GAMMA
+
+    night_len = (s["end_min"] - s["start_min"]) % DAY_MIN
+    t = (minute - s["start_min"]) % DAY_MIN  # minutes since dimming began
+    fade, night = s["fade_min"], s["level"] / 100
+    if t < fade:
+        return ease(1.0, night, t / fade)
+    if t < night_len:
+        return night
+    if t < night_len + fade:
+        return ease(night, 1.0, (t - night_len) / fade)
+    return 1.0
+
+
+def schedule_now(schedule: dict) -> datetime:
+    """The current time on the clock the schedule is written for."""
+    tz = schedule.get("tz")
+    return datetime.now(zoneinfo.ZoneInfo(tz)) if tz else datetime.now().astimezone()
+
+
+def current_dim(schedule: dict | None) -> float:
+    if not schedule:
+        return 1.0
+    now = schedule_now(schedule)
+    return round(dim_at(schedule, now.hour * 60 + now.minute + now.second / 60), 3)
+
+
+def parse_clock(text: str) -> int:
+    m = re.fullmatch(r"([01]?\d|2[0-3]):([0-5]\d)", text)
+    if not m:
+        raise Fail(f"'{text}' is not a 24-hour time like 22:30")
+    return int(m[1]) * 60 + int(m[2])
+
+
+def clock(minutes: int) -> str:
+    return f"{minutes // 60:02d}:{minutes % 60:02d}"
+
+
+def describe_schedule(s: dict | None) -> str:
+    if not s:
+        return "none"
+    fade = f", fading over {s['fade_min']} min" if s["fade_min"] else ""
+    # Spell out which clock is in use: the system's may not be the one on the wall.
+    now = schedule_now(s)
+    return (f"dim to {s['level']}% from {clock(s['start_min'])} to {clock(s['end_min'])}{fade}"
+            f" (now {now:%H:%M} {s.get('tz') or now.tzname()}, at {round(current_dim(s) * 100)}%)")
+
+
+# --- saved files -------------------------------------------------------------
+
+def read_json(path: Path) -> object | None:
     try:
-        tmp = STATE.with_suffix(".tmp")
-        tmp.write_text(json.dumps(state) + "\n")
-        os.replace(tmp, STATE)
-    except OSError as e:
-        print(f"note: applied, but could not save for next boot ({STATE}: {e.strerror})", file=sys.stderr)
-
-
-def load_saved() -> dict | None:
-    try:
-        return normalize(json.loads(STATE.read_text()))
+        return json.loads(path.read_text())
     except FileNotFoundError:
         return None
-    except (ValueError, AttributeError, Fail) as e:
-        raise Fail(f"ignoring invalid {STATE}: {e}") from e
+    except ValueError as e:
+        raise Fail(f"{path} is not valid JSON") from e
 
+
+def write_json(path: Path, data: object) -> None:
+    # Replace rather than overwrite: root and the user both write these, and a
+    # rename only needs the directory to be writable, whoever owns the old file.
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(json.dumps(data) + "\n")
+        os.chmod(tmp, 0o664)
+        os.replace(tmp, path)
+    except BaseException:
+        os.unlink(tmp)
+        raise
+
+
+def load_mode() -> dict | None:
+    raw = read_json(MODE_FILE)
+    try:
+        return None if raw is None else normalize(raw)
+    except Fail as e:
+        raise Fail(f"invalid {MODE_FILE}: {e}") from e
+
+
+def load_schedule() -> dict | None:
+    raw = read_json(SCHEDULE_FILE)
+    try:
+        return None if raw is None else normalize_schedule(raw)
+    except Fail as e:
+        raise Fail(f"invalid {SCHEDULE_FILE}: {e}") from e
+
+
+def boot_id() -> str:
+    return Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+
+
+def load_applied() -> tuple[dict, float] | None:
+    """The mode and dim factor last written to the LED, if known for this boot."""
+    try:
+        raw = read_json(APPLIED_FILE)
+        # The LED resets when the machine restarts, so an older record is void.
+        if not isinstance(raw, dict) or raw.get("boot") != boot_id():
+            return None
+        dim = raw.get("dim")
+        if isinstance(dim, bool) or not isinstance(dim, (int, float)):
+            return None
+        return normalize(raw.get("state")), float(dim)
+    except Fail:
+        return None
+
+
+def show(state: dict, dim: float) -> None:
+    apply(state, dim)
+    try:
+        write_json(APPLIED_FILE, {"boot": boot_id(), "state": state, "dim": dim})
+    except OSError:
+        pass  # not installed; only costs the schedule its memory of what is showing
+
+
+def showing() -> dict:
+    """The mode currently on the LED, as far as we know."""
+    applied = load_applied()
+    return applied[0] if applied else load_mode() or DEFAULT_MODE
+
+
+# --- commands ----------------------------------------------------------------
 
 def udev_hook() -> None:
     """Run as root by the udev rule on add/change events for the LED."""
@@ -169,22 +338,60 @@ def udev_hook() -> None:
     # Only on "add": applying a mode sets a trigger, which emits a "change"
     # event, and restoring on that too would loop.
     if os.environ.get("ACTION") == "add":
-        state = load_saved()
-        if state:
-            apply(state)
+        mode, schedule = load_mode(), load_schedule()
+        if mode or schedule:
+            show(mode or DEFAULT_MODE, current_dim(schedule))
+
+
+def tick() -> None:
+    """Run every minute by the systemd timer: follow the schedule."""
+    schedule = load_schedule()
+    if not schedule:
+        return
+    dim = current_dim(schedule)
+    applied = load_applied()
+    # Re-applying would restart a running effect, so only act on a change.
+    if applied and applied[1] == dim:
+        return
+    show(showing(), dim)
+
+
+def schedule_command(a: argparse.Namespace) -> None:
+    if a.off:
+        SCHEDULE_FILE.unlink(missing_ok=True)
+        show(showing(), 1.0)
+        print("schedule: none")
+        return
+    if a.start is None and a.end is None:
+        print(f"schedule: {describe_schedule(load_schedule())}")
+        return
+    if a.start is None or a.end is None:
+        raise Fail("give both --from and --to")
+    schedule = normalize_schedule({"start_min": parse_clock(a.start), "end_min": parse_clock(a.end),
+                                   "level": a.level, "fade_min": a.fade, "tz": a.tz})
+    try:
+        write_json(SCHEDULE_FILE, schedule)
+    except OSError as e:
+        raise Fail(f"cannot save {SCHEDULE_FILE}: {e.strerror} (run install.sh)") from e
+    show(showing(), current_dim(schedule))
+    print(f"schedule: {describe_schedule(schedule)}")
 
 
 def status() -> None:
+    def safe(load, render):
+        try:
+            return render(load())
+        except Fail as e:
+            return str(e)
+
     active, _ = read_trigger()
     raw = int((LED / "brightness").read_text())
     print(f"led:        {LED}")
     print(f"trigger:    {active}")
     print(f"brightness: {raw}/{max_brightness()} ({round(raw * 100 / max_brightness())}%)")
-    try:
-        saved = load_saved()
-    except Fail as e:
-        saved = str(e)
-    print(f"saved mode: {json.dumps(saved) if isinstance(saved, dict) else saved or 'none (card default: full brightness)'}")
+    print(f"showing:    {json.dumps(showing()) if load_applied() else 'unknown (not set by gpu-logo since boot)'}")
+    print(f"saved mode: {safe(load_mode, lambda m: json.dumps(m) if m else 'none (card default: full brightness)')}")
+    print(f"schedule:   {safe(load_schedule, describe_schedule)}")
 
 
 def main() -> None:
@@ -207,8 +414,23 @@ def main() -> None:
     sub.add_parser("heartbeat", help="double-pulse that speeds up with system load")
     sub.add_parser("activity", help="CPU load meter: faint slow flashes when idle, fast and bright when busy")
     sub.add_parser("disk", help="flicker on disk activity")
+    s = sub.add_parser(
+        "schedule", help="dim at night (no arguments: show the schedule)",
+        description="Dim whatever mode is showing during a daily period. Times are 24-hour, on the "
+                    "system clock unless --tz is given. With no arguments, show the current schedule.")
+    s.add_argument("--from", dest="start", metavar="HH:MM", help="when dimming begins")
+    s.add_argument("--to", dest="end", metavar="HH:MM", help="when brightening begins")
+    s.add_argument("--level", type=int, default=10, metavar="PERCENT",
+                   help="brightness while dimmed, as a percent of normal (default 10; 0 is off)")
+    s.add_argument("--fade", type=int, default=30, metavar="MIN",
+                   help="minutes each transition takes (default 30; 0 switches instantly)")
+    s.add_argument("--tz", metavar="ZONE",
+                   help="timezone the times are in, e.g. America/New_York (default: the system's)")
+    s.add_argument("--off", action="store_true", help="remove the schedule")
     sub.add_parser("restore", help="re-apply the saved mode")
-    sub.add_parser("udev-hook")  # internal, run by the udev rule; no help= keeps it out of --help
+    # Internal, run by the udev rule and the systemd timer; no help= keeps them out of --help.
+    sub.add_parser("udev-hook")
+    sub.add_parser("tick")
     a = p.parse_args()
 
     try:
@@ -218,11 +440,15 @@ def main() -> None:
             return status()
         if a.cmd == "udev-hook":
             return udev_hook()
+        if a.cmd == "tick":
+            return tick()
+        if a.cmd == "schedule":
+            return schedule_command(a)
         if a.cmd == "restore":
-            state = load_saved()
+            state = load_mode()
             if not state:
                 raise Fail("no saved mode")
-            return apply(state)
+            return show(state, current_dim(load_schedule()))
 
         if a.cmd in ("on", "off"):
             raw = {"mode": "static", "level": 100 if a.cmd == "on" else 0}
@@ -235,9 +461,13 @@ def main() -> None:
         else:
             raw = {"mode": a.cmd}
         state = normalize(raw)
-        apply(state)
+        show(state, current_dim(load_schedule()))
         if not a.no_save:
-            save(state)
+            try:
+                write_json(MODE_FILE, state)
+            except OSError as e:
+                print(f"note: applied, but could not save for next boot ({MODE_FILE}: {e.strerror})",
+                      file=sys.stderr)
     except Fail as e:
         sys.exit(f"gpu-logo: {e}")
 
