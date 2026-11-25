@@ -1,13 +1,20 @@
-"""Tests for the parts of gpu-logo that do not need the real card.
+"""Tests for the parts of gpu-logo (and observe.py) that do not need real hardware.
 
 Run from the repository root:  python3 -m unittest discover tests
 """
+import fcntl
 import importlib.machinery
 import importlib.util
+import io
 import os
+import stat
+import subprocess
+import sys
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 REPO = Path(__file__).resolve().parent.parent
 
@@ -20,6 +27,25 @@ def load_tool(led_dir: Path, state_dir: Path):
     module = importlib.util.module_from_spec(importlib.util.spec_from_loader("gpu_logo", loader))
     loader.exec_module(module)
     return module
+
+
+def load_observe():
+    spec = importlib.util.spec_from_file_location("observe", REPO / "tools" / "observe.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def pattern_duration_ms(pattern: str) -> int:
+    """Real cycle duration under Linux's ledtrig-pattern timing rules.
+
+    Adjacent tuples with different brightness levels spend one extra 50 ms redraw;
+    adjacent tuples at the same level hold for exactly the written duration.
+    """
+    values = [int(v) for v in pattern.split()]
+    levels, times = values[::2], values[1::2]
+    n = len(levels)
+    return sum(times[i] + (50 if levels[i] != levels[(i + 1) % n] else 0) for i in range(n))
 
 
 class GpuLogoTest(unittest.TestCase):
@@ -35,19 +61,21 @@ class GpuLogoTest(unittest.TestCase):
         (self.led / "trigger").write_text("none\n")
         self.g = load_tool(self.led, self.state)
         self.g.SYNC_WAIT_S = 0  # a fake LED never reaches its resting level
+        self.available_triggers = ["none", "timer", "pattern", "heartbeat", "activity", "disk-activity"]
         # A plain file cannot list the available triggers the way sysfs does.
-        self.g.read_trigger = lambda: (self.attr("trigger"), ["none", "timer", "pattern", "heartbeat",
-                                                              "activity", "disk-activity"])
+        self.g.read_trigger = lambda: (self.attr("trigger"), list(self.available_triggers))
 
     def attr(self, name: str) -> str:
         return (self.led / name).read_text().strip()
 
 
 class ScheduleTest(GpuLogoTest):
-    def schedule(self, dim="23:30-02:00", brighten="08:30-09:00", level=10):
+    def schedule(self, dim="23:30-02:00", brighten="08:30-09:00", level=10, tz=None):
         (ds, de), (bs, be) = self.g.parse_span(dim), self.g.parse_span(brighten)
-        return self.g.normalize_schedule(
-            {"dim_start": ds, "dim_end": de, "bright_start": bs, "bright_end": be, "level": level})
+        raw = {"dim_start": ds, "dim_end": de, "bright_start": bs, "bright_end": be, "level": level}
+        if tz is not None:
+            raw["tz"] = tz
+        return self.g.normalize_schedule(raw)
 
     def at(self, schedule, clock):
         return self.g.dim_at(schedule, self.g.parse_clock(clock))
@@ -78,12 +106,30 @@ class ScheduleTest(GpuLogoTest):
         self.assertEqual(self.at(s, "04:59"), 0.0)
         self.assertEqual(self.at(s, "05:00"), 1.0)
 
+    def test_dst_transitions_follow_wall_clock(self):
+        ny = ZoneInfo("America/New_York")
+        # Fall-back night: 2026-11-01 repeats 01:00-01:59.
+        s = self.schedule(dim="23:00", brighten="01:30-02:30", level=10, tz="America/New_York")
+        before_fallback = datetime(2026, 11, 1, 1, 59, tzinfo=ny, fold=0)
+        after_fallback = datetime(2026, 11, 1, 1, 0, tzinfo=ny, fold=1)
+        self.assertGreater(self.g.current_dim(s, before_fallback), 0.1)
+        self.assertEqual(self.g.current_dim(s, after_fallback), 0.1)
+
+        # Spring-forward night: 2026-03-08 skips 02:00-02:59.
+        s2 = self.schedule(dim="23:00", brighten="02:00-03:00", level=10, tz="America/New_York")
+        before_spring = datetime(2026, 3, 8, 1, 59, tzinfo=ny)
+        after_spring = datetime(2026, 3, 8, 3, 0, tzinfo=ny)
+        self.assertEqual(self.g.current_dim(s2, before_spring), 0.1)
+        self.assertEqual(self.g.current_dim(s2, after_spring), 1.0)
+
     def test_rejects_bad_schedules(self):
         for dim, brighten, level in [
             ("22:00", "22:00", 10),              # never dimmed
             ("23:30-02:00", "01:00-09:00", 10),  # brightening starts mid-dim
             ("23:00-01:00", "01:00-23:30", 10),  # the two fades overlap round the clock
             ("22:00", "07:00", 101),
+            ("23:30-", "08:00", 10),             # trailing dash without end time
+            ("-02:00", "08:00", 10),
         ]:
             with self.assertRaises(self.g.Fail, msg=(dim, brighten)):
                 self.schedule(dim, brighten, level)
@@ -117,6 +163,17 @@ class NormalizeTest(GpuLogoTest):
     def test_drops_unknown_keys(self):
         self.assertEqual(self.g.normalize({"mode": "disk", "extra": "x"}), {"mode": "disk"})
 
+    def test_cli_rejects_non_finite_breathe_period(self):
+        for bad in ("nan", "inf", "-inf"):
+            res = subprocess.run(
+                [sys.executable, str(REPO / "gpu-logo"), "breathe", f"--period={bad}"],
+                env=os.environ | {"GPU_LOGO_LED": str(self.led), "GPU_LOGO_STATE_DIR": str(self.state)},
+                capture_output=True, text=True, check=False,
+            )
+            self.assertNotEqual(res.returncode, 0)
+            self.assertIn("finite", res.stderr)
+            self.assertNotIn("Traceback", res.stderr)
+
 
 class ApplyTest(GpuLogoTest):
     def test_static_is_scaled_by_dim(self):
@@ -134,14 +191,26 @@ class ApplyTest(GpuLogoTest):
             self.g.apply(mode, dim=0.0)
             self.assertEqual((self.attr("trigger"), self.attr("brightness")), ("none", "0"), mode)
 
-    def test_breathe_peak_is_scaled_by_dim(self):
-        self.g.apply({"mode": "breathe", "period_ms": 4000, "min": 0, "max": 100}, dim=0.2)
-        levels = [int(v) for v in self.attr("pattern").split()[::2]]
-        self.assertEqual((self.attr("trigger"), min(levels), max(levels)), ("pattern", 0, 51))
+    def test_breathe_peak_is_scaled_by_dim_and_keeps_period(self):
+        for dim, expected_peak in [(1.0, 255), (0.2, 51), (0.1, 26)]:
+            self.g.apply({"mode": "breathe", "period_ms": 4000, "min": 0, "max": 100}, dim=dim)
+            pat = self.attr("pattern")
+            levels = [int(v) for v in pat.split()[::2]]
+            self.assertEqual((self.attr("trigger"), min(levels), max(levels)), ("pattern", 0, expected_peak))
+            self.assertEqual(pattern_duration_ms(pat), 4000, f"dim={dim}")
 
     def test_disk_mode_sets_its_flash_level(self):
         self.g.apply({"mode": "disk"}, dim=0.5)
         self.assertEqual((self.attr("trigger"), self.attr("brightness")), ("disk-activity", "128"))
+
+    def test_missing_trigger_leaves_current_effect_intact(self):
+        self.g.apply({"mode": "breathe", "period_ms": 4000, "min": 0, "max": 100})
+        before_pattern = self.attr("pattern")
+        self.available_triggers.remove("disk-activity")
+        with self.assertRaises(self.g.Fail):
+            self.g.apply({"mode": "disk"})
+        self.assertEqual(self.attr("trigger"), "pattern")
+        self.assertEqual(self.attr("pattern"), before_pattern)
 
     def test_changing_a_running_pattern_keeps_the_trigger(self):
         writes = []
@@ -156,10 +225,9 @@ class ApplyTest(GpuLogoTest):
 class HeartbeatTest(GpuLogoTest):
     def shape(self, effort, dim=1.0):
         """(levels, real duration in ms) of the beat at this effort."""
-        values = [int(v) for v in self.g.heartbeat_pattern(effort, dim).split()]
-        levels, times = values[::2], values[1::2]
-        # every fading tuple costs the kernel one extra 50 ms redraw; the final wait does not
-        return levels, sum(times[:-1]) + 50 * (len(times) - 1) + times[-1]
+        pat = self.g.heartbeat_pattern(effort, dim)
+        levels = [int(v) for v in pat.split()[::2]]
+        return levels, pattern_duration_ms(pat)
 
     def test_calm_is_slow_and_soft_and_flat_out_is_fast_and_strong(self):
         calm, calm_ms = self.shape(0.0)
@@ -168,6 +236,11 @@ class HeartbeatTest(GpuLogoTest):
         self.assertEqual(max(hard), 255)
         self.assertTrue(max(calm) < 60)
         self.assertTrue(min(calm) > 0)  # a glow remains between beats
+
+    def test_low_dim_heartbeat_preserves_duration_when_levels_collide(self):
+        # At dim=0.08 calm, peak=3, base=1, so dip == dub == 2.
+        _, ms = self.shape(0.0, dim=0.08)
+        self.assertEqual(ms, 3000)
 
     def test_beat_returns_to_its_resting_level_only_at_rest(self):
         for effort in [0.0, 0.5, 1.0]:
@@ -187,17 +260,101 @@ class HeartbeatTest(GpuLogoTest):
         self.assertEqual(self.g.next_step(3.9 / steps, 3), 4)
 
 
-class TickTest(GpuLogoTest):
-    """The schedule follows whatever is showing, and leaves it alone when nothing changed."""
+class SecurityAndStateTest(GpuLogoTest):
+    def test_read_json_rejects_symlinks_fifos_and_oversized_files(self):
+        target = self.state / "real.json"
+        target.write_text('{"mode": "disk"}\n')
+        link = self.state / "link.json"
+        link.symlink_to(target)
+        with self.assertRaises(self.g.Fail):
+            self.g.read_json(link)
+
+        fifo = self.state / "fifo.json"
+        os.mkfifo(fifo)
+        with self.assertRaises(self.g.Fail):
+            self.g.read_json(fifo)
+
+        big = self.state / "big.json"
+        big.write_text(" " * (self.g.MAX_JSON_BYTES + 10))
+        with self.assertRaises(self.g.Fail):
+            self.g.read_json(big)
+
+    def test_write_json_replaces_symlink_without_touching_target(self):
+        victim = self.state / "victim.txt"
+        victim.write_text("untouched")
+        victim.chmod(0o600)
+        link = self.state / "state.json"
+        link.symlink_to(victim)
+
+        self.g.write_json(link, {"mode": "disk"})
+        self.assertFalse(link.is_symlink())
+        self.assertEqual(stat.S_IMODE(link.stat().st_mode), 0o664)
+        self.assertEqual(victim.read_text(), "untouched")
+        self.assertEqual(stat.S_IMODE(victim.stat().st_mode), 0o600)
+
+    def test_load_applied_rejects_out_of_range_and_non_finite_dim(self):
+        for bad_dim in [-0.1, 1.1, float("nan"), float("inf"), True, "0.5"]:
+            (self.state / "applied.json").write_text(
+                f'{{"boot": "{self.g.boot_id()}", "state": {{"mode": "cpu"}}, "dim": '
+                + ("NaN" if bad_dim != bad_dim else "Infinity" if bad_dim == float("inf")
+                   else "true" if bad_dim is True else repr(bad_dim).replace("'", '"'))
+                + "}\n"
+            )
+            self.assertIsNone(self.g.load_applied(), bad_dim)
+
+    def test_state_lock_rejects_symlink_and_times_out_when_contended(self):
+        other = self.state / "other"
+        other.write_text("")
+        self.g.LOCK_FILE.symlink_to(other)
+        with self.assertRaises(self.g.Fail):
+            with self.g.state_lock(timeout=0.05):
+                pass
+        self.g.LOCK_FILE.unlink()
+
+        self.g.LOCK_FILE.write_text("")
+        with open(self.g.LOCK_FILE, "r+b") as holder:
+            fcntl.flock(holder.fileno(), fcntl.LOCK_EX)
+            try:
+                with self.assertRaises(self.g.Fail):
+                    with self.g.state_lock(timeout=0.05):
+                        pass
+            finally:
+                fcntl.flock(holder.fileno(), fcntl.LOCK_UN)
+
+    def test_udev_hook_tolerates_disappearing_trigger_attribute(self):
+        pattern_attr = self.led / "pattern"
+        pattern_attr.write_text("0 100\n")
+        real_chown = self.g.shutil.chown
+        seen = []
+
+        def flaky_chown(path, group=None):
+            seen.append(Path(path).name)
+            if Path(path).name == "pattern":
+                pattern_attr.unlink()
+                raise FileNotFoundError(path)
+            # Don't require the real plugdev group in unit tests.
+            return None
+
+        self.g.shutil.chown = flaky_chown
+        try:
+            os.environ["ACTION"] = "change"
+            self.g.udev_hook()
+        finally:
+            self.g.shutil.chown = real_chown
+            os.environ.pop("ACTION", None)
+        self.assertIn("brightness", seen)
+        self.assertIn("pattern", seen)
+
+
+class TickAndDaemonTest(GpuLogoTest):
+    """The schedule follows whatever is showing, and coordinates cleanly with cpu-daemon."""
 
     def set_schedule(self, level):
-        # A period covering the whole day except one minute that is never "now"
-        # would be fragile, so pin the clock instead.
         self.g.write_json(self.g.SCHEDULE_FILE, {"dim_start": 0, "dim_end": 0, "bright_start": 720,
                                                  "bright_end": 720, "level": level})
 
     def test_tick_dims_the_showing_mode_once(self):
-        self.g.current_dim = lambda schedule: 0.25 if schedule else 1.0
+        self.g.current_dim = lambda schedule, now=None: 0.25 if schedule else 1.0
         self.g.show({"mode": "static", "level": 80}, 1.0)
         self.set_schedule(25)
         self.g.tick()
@@ -207,13 +364,88 @@ class TickTest(GpuLogoTest):
         self.assertEqual(self.attr("brightness"), "7")
 
     def test_tick_leaves_a_running_heartbeat_to_the_daemon(self):
-        self.g.current_dim = lambda schedule: 0.25 if schedule else 1.0
+        self.g.current_dim = lambda schedule, now=None: 0.25 if schedule else 1.0
         self.g.show({"mode": "cpu"}, 1.0)
         before = self.attr("pattern")
         self.set_schedule(25)
         self.g.tick()
         self.assertEqual(self.attr("pattern"), before)
         self.assertEqual(self.g.load_applied(), ({"mode": "cpu"}, 0.25))
+        self.assertTrue(self.g.CPU_ACTIVE_FILE.exists())
+
+    def test_tick_turns_off_running_heartbeat_at_dim_zero_and_restores_it(self):
+        dim_value = [0.0]
+        self.g.current_dim = lambda schedule, now=None: dim_value[0] if schedule else 1.0
+        self.g.show({"mode": "cpu"}, 1.0)
+        self.assertEqual(self.attr("trigger"), "pattern")
+        self.set_schedule(0)
+
+        # Evening: dim reaches 0.0 -> LED must actually turn off.
+        self.g.tick()
+        self.assertEqual((self.attr("trigger"), self.attr("brightness")), ("none", "0"))
+        self.assertEqual(self.g.load_applied(), ({"mode": "cpu"}, 0.0))
+
+        # Morning: dim rises back to 0.5 -> LED must resume heartbeat pattern.
+        dim_value[0] = 0.5
+        self.g.tick()
+        self.assertEqual(self.attr("trigger"), "pattern")
+        self.assertEqual(self.g.load_applied(), ({"mode": "cpu"}, 0.5))
+        self.assertTrue(self.g.CPU_ACTIVE_FILE.exists())
+
+    def test_tick_does_not_overwrite_newer_cli_off_during_pattern_wait(self):
+        self.g.current_dim = lambda schedule, now=None: 0.25 if schedule else 1.0
+        self.g.show({"mode": "breathe", "period_ms": 4000, "min": 0, "max": 100}, 1.0)
+        self.set_schedule(25)
+
+        def cli_turns_off_mid_wait(still_wanted=lambda: True):
+            self.g.show({"mode": "static", "level": 0}, 0.25)
+
+        self.g.wait_for_pattern_rest = cli_turns_off_mid_wait
+        self.g.tick()
+        self.assertEqual((self.attr("trigger"), self.attr("brightness")), ("none", "0"))
+        self.assertEqual(self.g.load_applied(), ({"mode": "static", "level": 0}, 0.25))
+
+    def test_cpu_daemon_step_does_not_overwrite_newer_breathe_selection(self):
+        self.g.show({"mode": "cpu"}, 1.0)
+        seen = self.g._applied_stamp()
+        breathe = {"mode": "breathe", "period_ms": 4000, "min": 0, "max": 100}
+        orig_wait = self.g.wait_for_pattern_rest
+
+        def cli_switches_to_breathe(still_wanted=lambda: True):
+            self.g.wait_for_pattern_rest = orig_wait
+            self.g.show(breathe, 1.0)
+
+        self.g.wait_for_pattern_rest = cli_switches_to_breathe
+        keep, step, changed = self.g._cpu_daemon_step(seen, 0, 1.0, 5)
+        self.assertTrue(keep)
+        self.assertTrue(changed)
+        self.assertEqual(step, 0)
+        self.assertEqual(self.attr("pattern"), self.g.breathe_pattern(4000, 0, 255))
+        self.assertFalse(self.g.CPU_ACTIVE_FILE.exists())
+
+    def test_cpu_daemon_step_turns_off_at_dim_zero_and_restarts_pattern(self):
+        self.g.show({"mode": "cpu"}, 1.0)
+        self.g.record_applied({"mode": "cpu"}, 0.0)
+        seen = self.g._applied_stamp()
+        keep, step, changed = self.g._cpu_daemon_step(seen, None, 0.0, 4)
+        self.assertTrue(keep)
+        self.assertFalse(changed)
+        self.assertEqual(step, 4)
+        self.assertEqual((self.attr("trigger"), self.attr("brightness")), ("none", "0"))
+
+        # Low dim where calm is steady (no beat) but full load beats again.
+        self.g.record_applied({"mode": "cpu"}, 0.02)
+        seen = self.g._applied_stamp()
+        keep, step, changed = self.g._cpu_daemon_step(seen, None, 0.02, self.g.CPU_STEPS)
+        self.assertTrue(keep)
+        self.assertEqual(self.attr("trigger"), "pattern")
+        self.assertEqual(self.attr("pattern"), self.g.heartbeat_pattern(1.0, 0.02))
+
+    def test_cpu_active_flag_tracks_mode(self):
+        self.g.show({"mode": "cpu"}, 1.0)
+        self.assertTrue(self.g.CPU_ACTIVE_FILE.exists())
+        self.g.show({"mode": "static", "level": 0}, 1.0)
+        self.assertFalse(self.g.CPU_ACTIVE_FILE.exists())
 
     def test_tick_without_a_schedule_does_nothing(self):
         self.g.tick()
@@ -223,6 +455,39 @@ class TickTest(GpuLogoTest):
         self.g.show({"mode": "static", "level": 80}, 1.0)
         self.g.boot_id = lambda: "a-later-boot"
         self.assertIsNone(self.g.load_applied())
+
+
+class ObserveTest(unittest.TestCase):
+    def test_measure_checks_frame_bounds_and_counts_lit_pixels(self):
+        try:
+            from PIL import Image
+        except ImportError:
+            self.skipTest("Pillow not installed")
+        obs = load_observe()
+        with tempfile.TemporaryDirectory() as d:
+            small = Path(d) / "small.jpg"
+            Image.new("RGB", (320, 180), (0, 0, 0)).save(small)
+            with self.assertRaises(SystemExit):
+                obs.measure(small)
+
+            ok = Path(d) / "ok.jpg"
+            img = Image.new("RGB", (640, 360), (0, 0, 0))
+            for x in range(300, 310):
+                for y in range(170, 180):
+                    img.putpixel((x, y), (0, 0, 255))
+            img.save(ok, quality=95)
+            m = obs.measure(ok)
+            self.assertEqual(m["size"], (640, 360))
+            self.assertGreater(m["lit"], 50)
+
+    def test_rejects_bad_series_durations(self):
+        for bad in ("0", "-2", "nan", "inf", "0.001"):
+            res = subprocess.run(
+                [sys.executable, str(REPO / "tools" / "observe.py"), "--series", bad],
+                capture_output=True, text=True, check=False,
+            )
+            self.assertNotEqual(res.returncode, 0, bad)
+            self.assertNotIn("Traceback", res.stderr)
 
 
 if __name__ == "__main__":
