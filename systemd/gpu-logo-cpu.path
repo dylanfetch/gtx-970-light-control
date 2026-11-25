@@ -1,9 +1,10 @@
 [Unit]
-Description=Start the gpu-logo CPU heartbeat when the mode changes
+Description=Start the gpu-logo CPU heartbeat while CPU mode is active
 
 [Path]
-# gpu-logo replaces files in this directory whenever it changes the LED.
-PathChanged=/var/lib/gpu-logo
+# Level-triggered so rapid transitions cannot be missed while the service exits.
+# gpu-logo creates this marker in cpu mode and removes it for every other mode.
+PathExists=/var/lib/gpu-logo/cpu.active
 Unit=gpu-logo-cpu.service
 
 [Install]
