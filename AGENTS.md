@@ -89,7 +89,10 @@ brightness 255 and another at 0 and take the bounding box of what changed.
   LED writes, state files (`/var/lib/gpu-logo/state/`), and `.cpu.lock` handoff
   through the root-owned `/var/lib/gpu-logo/.lock`. `cpu-daemon` re-checks the
   active mode under that lock immediately before every write and releases
-  `.cpu.lock` under the lock before exiting.
+  `.cpu.lock` under the lock on both clean and error exits. `gpu-logo-cpu.service`
+  uses bounded `Restart=on-failure` so an unexpected sampler failure cannot
+  strand a concurrent `cpu` selection, while a failed `applied.json` write
+  invalidates any stale record instead of letting `cpu-daemon` undo `off`.
 - `gpu-logo-cpu.path` watches the pre-created regular file
   `/var/lib/gpu-logo/cpu.wake` (`PathModified=`) under root-owned
   `/var/lib/gpu-logo/`, so temp files never trigger spurious starts and group

@@ -19,12 +19,16 @@ if ! getent group "$group" >/dev/null 2>&1; then
 fi
 modprobe -a ledtrig-pattern ledtrig-timer
 
+# Pause existing services while updating units and migrating state.
+systemctl stop gpu-logo-schedule.service gpu-logo-cpu.service 2>/dev/null || true
+
 install -m 755 "$here/gpu-logo" /usr/local/bin/gpu-logo
 install -m 644 "$here/udev/70-gpu-logo-led.rules" /etc/udev/rules.d/70-gpu-logo-led.rules
 install -m 644 "$here/modules-load.d/gpu-logo.conf" /etc/modules-load.d/gpu-logo.conf
 install -m 644 "$here"/systemd/gpu-logo-* /etc/systemd/system/
 
-# Provision /var/lib/gpu-logo safely without following symlinks:
+# Provision /var/lib/gpu-logo safely without following symlinks or trusting
+# hard-linked legacy control files:
 #   /var/lib/gpu-logo           0750 root:$group  (immutable to group members)
 #   /var/lib/gpu-logo/.root-tmp 0700 root:root    (privileged atomic write staging)
 #   /var/lib/gpu-logo/.lock     0640 root:$group  (shared writer lock)
@@ -32,6 +36,7 @@ install -m 644 "$here"/systemd/gpu-logo-* /etc/systemd/system/
 #   /var/lib/gpu-logo/cpu.wake  0660 root:$group  (watched by gpu-logo-cpu.path)
 #   /var/lib/gpu-logo/state     2770 root:$group  (group-writable JSON state)
 python3 - "$group" <<'PY'
+import fcntl
 import grp
 import os
 import secrets
@@ -50,17 +55,21 @@ except FileExistsError:
     pass
 base_fd = os.open(base, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
 try:
+    orig_st = os.fstat(base_fd)
+    legacy_writable = orig_st.st_uid != 0 or bool(orig_st.st_mode & 0o022)
     # Remove group write on the top-level directory FIRST so group members
     # cannot swap any control entries inside it during upgrade or reinstall.
     os.fchown(base_fd, 0, gid)
     os.fchmod(base_fd, 0o750)
 
-    def ensure_dir(name: str, owner_gid: int, mode: int) -> int:
+    def ensure_dir(name: str, owner_gid: int, mode: int, require_root: bool = False) -> int:
         try:
             st = os.lstat(name, dir_fd=base_fd)
             if not stat.S_ISDIR(st.st_mode):
                 os.unlink(name, dir_fd=base_fd)
                 os.mkdir(name, mode, dir_fd=base_fd)
+            elif require_root and st.st_uid != 0:
+                raise SystemExit(f"install.sh: unsafe non-root directory at {base / name}")
         except FileNotFoundError:
             os.mkdir(name, mode, dir_fd=base_fd)
         dfd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=base_fd)
@@ -68,25 +77,8 @@ try:
         os.fchmod(dfd, mode)
         return dfd
 
-    def ensure_file(name: str, owner_gid: int, mode: int) -> None:
-        try:
-            st = os.lstat(name, dir_fd=base_fd)
-            if not stat.S_ISREG(st.st_mode):
-                if stat.S_ISDIR(st.st_mode):
-                    raise SystemExit(f"install.sh: unexpected directory at {base / name}")
-                os.unlink(name, dir_fd=base_fd)
-        except FileNotFoundError:
-            pass
-        fd = os.open(name, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK, mode, dir_fd=base_fd)
-        try:
-            if not stat.S_ISREG(os.fstat(fd).st_mode):
-                raise SystemExit(f"install.sh: {base / name} is not a regular file")
-            os.fchown(fd, 0, owner_gid)
-            os.fchmod(fd, mode)
-        finally:
-            os.close(fd)
-
-    def write_fresh(dst_dir_fd: int, stage_dir_fd: int, name: str, data: bytes) -> None:
+    def write_fresh(dst_dir_fd: int, stage_dir_fd: int, name: str, data: bytes,
+                    owner_gid: int, mode: int) -> tuple[int, int]:
         while True:
             tmp = f".{name}.{secrets.token_hex(8)}"
             try:
@@ -97,11 +89,14 @@ try:
         try:
             with os.fdopen(wfd, "wb") as f:
                 wfd = -1
-                f.write(data)
-                f.flush()
-                os.fchown(f.fileno(), 0, gid)
-                os.fchmod(f.fileno(), 0o660)
+                if data:
+                    f.write(data)
+                    f.flush()
+                os.fchown(f.fileno(), 0, owner_gid)
+                os.fchmod(f.fileno(), mode)
+                st = os.fstat(f.fileno())
             os.replace(tmp, name, src_dir_fd=stage_dir_fd, dst_dir_fd=dst_dir_fd)
+            return st.st_dev, st.st_ino
         except BaseException:
             if wfd >= 0:
                 os.close(wfd)
@@ -110,6 +105,38 @@ try:
             except OSError:
                 pass
             raise
+
+    def ensure_control_file(name: str, stage_dir_fd: int, owner_gid: int, mode: int,
+                            seen_inodes: set[tuple[int, int]]) -> None:
+        # Preserve an existing control inode only on reinstalls from a hardened
+        # root-owned base, and only when it is a root-owned unlinked-unique
+        # regular file (nlink == 1) distinct from all other control files.
+        if not legacy_writable:
+            try:
+                fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=base_fd)
+            except FileNotFoundError:
+                fd = -1
+            except OSError:
+                fd = -1
+            if fd >= 0:
+                try:
+                    st = os.fstat(fd)
+                    key = (st.st_dev, st.st_ino)
+                    if stat.S_ISREG(st.st_mode) and st.st_uid == 0 and st.st_nlink == 1 and key not in seen_inodes:
+                        os.fchown(fd, 0, owner_gid)
+                        os.fchmod(fd, mode)
+                        seen_inodes.add(key)
+                        return
+                finally:
+                    os.close(fd)
+        try:
+            st = os.lstat(name, dir_fd=base_fd)
+            if stat.S_ISDIR(st.st_mode):
+                raise SystemExit(f"install.sh: unexpected directory at {base / name}")
+        except FileNotFoundError:
+            pass
+        key = write_fresh(base_fd, stage_dir_fd, name, b"", owner_gid, mode)
+        seen_inodes.add(key)
 
     def read_regular(dir_fd: int, name: str) -> bytes | None:
         try:
@@ -130,48 +157,58 @@ try:
             if rfd >= 0:
                 os.close(rfd)
 
-    stage_fd = ensure_dir(".root-tmp", 0, 0o700)
+    stage_fd = ensure_dir(".root-tmp", 0, 0o700, require_root=True)
     try:
-        ensure_file(".lock", gid, 0o640)
-        ensure_file(".cpu.lock", gid, 0o640)
-        ensure_file("cpu.wake", gid, 0o660)
+        seen_inodes: set[tuple[int, int]] = set()
+        ensure_control_file(".lock", stage_fd, gid, 0o640, seen_inodes)
+        ensure_control_file(".cpu.lock", stage_fd, gid, 0o640, seen_inodes)
+        ensure_control_file("cpu.wake", stage_fd, gid, 0o660, seen_inodes)
 
-        state_fd = ensure_dir("state", gid, 0o2770)
+        # Hold the verified writer lock while migrating and re-staging state files
+        # so a concurrent CLI invocation cannot have its save overwritten.
+        lock_fd = os.open(".lock", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=base_fd)
         try:
-            # Migrate legacy top-level JSON files into state/ by copying into fresh
-            # root:$group inodes (never chowning untrusted inodes in place).
-            for name in ("state.json", "schedule.json", "applied.json"):
-                try:
-                    data = read_regular(base_fd, name)
-                except OSError:
-                    os.unlink(name, dir_fd=base_fd)
-                    continue
-                if data is not None:
-                    try:
-                        os.lstat(name, dir_fd=state_fd)
-                    except FileNotFoundError:
-                        write_fresh(state_fd, stage_fd, name, data)
-                    os.unlink(name, dir_fd=base_fd)
-
-            # Clean up legacy cpu.active marker if present at top level.
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            state_fd = ensure_dir("state", gid, 0o2770)
             try:
-                st = os.lstat("cpu.active", dir_fd=base_fd)
-                if not stat.S_ISDIR(st.st_mode):
-                    os.unlink("cpu.active", dir_fd=base_fd)
-            except FileNotFoundError:
-                pass
+                # Migrate legacy top-level JSON files into state/ into fresh root:$group inodes.
+                for name in ("state.json", "schedule.json", "applied.json"):
+                    try:
+                        data = read_regular(base_fd, name)
+                    except OSError:
+                        os.unlink(name, dir_fd=base_fd)
+                        continue
+                    if data is not None:
+                        try:
+                            os.lstat(name, dir_fd=state_fd)
+                        except FileNotFoundError:
+                            write_fresh(state_fd, stage_fd, name, data, gid, 0o660)
+                        os.unlink(name, dir_fd=base_fd)
 
-            # Re-stage existing regular state files under the current group so a
-            # GROUP change on reinstall revokes access from the previous group.
-            for name in ("state.json", "schedule.json", "applied.json"):
+                # Clean up legacy cpu.active marker if present at top level.
                 try:
-                    data = read_regular(state_fd, name)
-                except OSError as e:
-                    raise SystemExit(f"install.sh: unsafe state file {base / 'state' / name}: {e.strerror}") from e
-                if data is not None:
-                    write_fresh(state_fd, stage_fd, name, data)
+                    st = os.lstat("cpu.active", dir_fd=base_fd)
+                    if not stat.S_ISDIR(st.st_mode):
+                        os.unlink("cpu.active", dir_fd=base_fd)
+                except FileNotFoundError:
+                    pass
+
+                # Re-stage existing regular state files under the current group so a
+                # GROUP change on reinstall revokes access from the previous group.
+                for name in ("state.json", "schedule.json", "applied.json"):
+                    try:
+                        data = read_regular(state_fd, name)
+                    except OSError as e:
+                        raise SystemExit(f"install.sh: unsafe state file {base / 'state' / name}: {e.strerror}") from e
+                    if data is not None:
+                        write_fresh(state_fd, stage_fd, name, data, gid, 0o660)
+            finally:
+                os.close(state_fd)
         finally:
-            os.close(state_fd)
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            finally:
+                os.close(lock_fd)
     finally:
         os.close(stage_fd)
 finally:

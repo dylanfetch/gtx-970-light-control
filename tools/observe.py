@@ -79,7 +79,7 @@ def main() -> None:
         print(f"{out}  {w}x{h}  R={m['r']:.1f} G={m['g']:.1f} B={m['b']:.1f}  lit_px={m['lit']}/{m['n']}")
         return
 
-    min_series = 1 / FPS
+    min_series = math.ceil(100 / FPS) / 100
     if not math.isfinite(a.series) or not min_series <= a.series <= MAX_SERIES_S:
         ap.error(f"--series must be between {min_series:.2f} and {MAX_SERIES_S:g} seconds")
     sample_frames = max(1, round(a.series * FPS))

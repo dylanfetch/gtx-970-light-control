@@ -502,32 +502,51 @@ def _daemon_lock_held() -> bool:
         os.close(fd)
 
 
-def _wait_path_unit_armed(timeout: float = 2.0) -> None:
-    """If gpu-logo-cpu.path is paused behind an exiting daemon, wait for it to re-arm."""
-    if os.environ.get("ACTION") or not shutil.which("systemctl"):
-        return
+def _wait_path_unit_armed(timeout: float = 2.0, require_active: bool = True) -> bool:
+    """Wait for gpu-logo-cpu.path to be armed (SubState=waiting).
+
+    Returns True if a wake write should proceed, False if a live daemon has
+    already taken over while waiting, and raises Fail when systemd reports an
+    installed path unit is inactive/failed or fails to re-arm before timeout.
+    """
+    if not shutil.which("systemctl"):
+        return True
     deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
+    while True:
         try:
             res = subprocess.run(
-                ["systemctl", "show", "-p", "ActiveState,SubState", "--value", "gpu-logo-cpu.path"],
+                ["systemctl", "show", "-p", "LoadState,ActiveState,SubState", "--value", "gpu-logo-cpu.path"],
                 capture_output=True, text=True, timeout=1.0, check=False,
             )
         except (OSError, subprocess.TimeoutExpired):
-            return
+            return True
         if res.returncode != 0:
-            return
+            return True  # systemd not running (e.g. container)
         lines = [line.strip() for line in res.stdout.splitlines() if line.strip()]
-        if len(lines) < 2 or lines[0] != "active" or lines[1] != "running":
-            return
+        if len(lines) < 3 or lines[0] == "not-found":
+            return True  # unit not installed
+        _, active_state, sub_state = lines[0], lines[1], lines[2]
+        if active_state != "active":
+            if not require_active:
+                return True  # early boot udev add; multi-user.target starts the service
+            raise Fail(f"gpu-logo-cpu.path is {active_state}; run: sudo systemctl enable --now gpu-logo-cpu.path")
+        if sub_state != "running":
+            return True  # path watch is armed (waiting)
+        if _daemon_lock_held():
+            return False  # a fresh daemon already acquired the liveness lock
+        if time.monotonic() >= deadline:
+            if not require_active:
+                return True
+            raise Fail("timed out waiting for gpu-logo-cpu.path to re-arm; check systemctl status gpu-logo-cpu.service")
         time.sleep(0.02)
 
 
-def wake_cpu_daemon() -> None:
+def wake_cpu_daemon(require_path_active: bool = True) -> None:
     """Signal systemd's gpu-logo-cpu.path to start cpu-daemon via cpu.wake."""
     if not STATE_DIR.exists():
         return  # uninstalled checkout
-    _wait_path_unit_armed()
+    if not _wait_path_unit_armed(require_active=require_path_active):
+        return
     try:
         fd = os.open(CPU_WAKE_FILE, os.O_WRONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except FileNotFoundError as e:
@@ -703,10 +722,22 @@ def _applied_stamp() -> tuple[int, int] | None:
 
 
 def record_applied(state: dict, dim: float) -> None:
+    """Publish the applied mode and dim factor.
+
+    No-op when uninstalled (STATE_DIR absent). In an installed setup, failures
+    invalidate any stale applied record so cpu-daemon cannot re-apply an old
+    CPU mode over a newer off/static selection, then raise Fail.
+    """
+    if not STATE_DIR.exists():
+        return
     try:
         write_json(APPLIED_FILE, {"boot": boot_id(), "state": state, "dim": dim})
-    except OSError:
-        pass  # not installed; only costs the schedule its memory of what is showing
+    except OSError as e:
+        try:
+            APPLIED_FILE.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise Fail(f"cannot record applied state {APPLIED_FILE}: {e.strerror}") from e
 
 
 def _show_locked(state: dict, dim: float, wait_rest: bool = True) -> bool:
@@ -778,11 +809,19 @@ def cpu_daemon() -> None:
 
     systemd starts this at boot and whenever cpu.wake is written. It holds
     CPU_LOCK_FILE while active, releases it under state_lock before exiting,
-    and returns immediately unless cpu mode is showing.
+    and returns immediately unless cpu mode is showing. Unexpected failures
+    exit non-zero so systemd's bounded Restart=on-failure restarts the sampler
+    without stranding a concurrent cpu selection.
     """
     if not LED.exists():
         return
     daemon_fd: int | None = None
+
+    def release_daemon() -> None:
+        nonlocal daemon_fd
+        _release_fd(daemon_fd)
+        daemon_fd = None
+
     try:
         with state_lock():
             daemon_fd = _acquire_daemon_lock()
@@ -793,19 +832,12 @@ def cpu_daemon() -> None:
             if applied is None:  # nothing has drawn on the LED this boot
                 state = load_mode() or DEFAULT_MODE
                 if state["mode"] != "cpu":
-                    _release_fd(daemon_fd)
-                    daemon_fd = None
+                    release_daemon()
                     return
                 _show_locked(state, current_dim(load_schedule()))
             elif applied[0]["mode"] != "cpu":
-                _release_fd(daemon_fd)
-                daemon_fd = None
+                release_daemon()
                 return
-
-        def release_daemon() -> None:
-            nonlocal daemon_fd
-            _release_fd(daemon_fd)
-            daemon_fd = None
 
         seen = step = smooth = None
         dim = 1.0
@@ -836,7 +868,12 @@ def cpu_daemon() -> None:
             # Sleep last, so a mode change is always noticed before the next write.
             time.sleep(CPU_SAMPLE_S)
     finally:
-        _release_fd(daemon_fd)
+        if daemon_fd is not None:
+            try:
+                with state_lock(timeout=1.0):
+                    release_daemon()
+            except Fail:
+                release_daemon()
 
 
 # --- commands ----------------------------------------------------------------
@@ -859,7 +896,7 @@ def udev_hook() -> None:
             if mode or schedule:
                 needs_wake = _show_locked(mode or DEFAULT_MODE, current_dim(schedule))
         if needs_wake:
-            wake_cpu_daemon()
+            wake_cpu_daemon(require_path_active=False)
 
 
 def tick() -> None:

@@ -143,9 +143,9 @@ kernel LED device `nouveau` exposes.
 | `gpu-logo` | CLI. Fixed levels write `brightness`; effects program a kernel LED trigger. No background process stays running except in `cpu` mode. |
 | `udev/70-gpu-logo-led.rules` | Runs `gpu-logo udev-hook` as root on `add`/`change` events: grants `GROUP` write access to the LED's sysfs attributes and restores the saved mode on `add`. |
 | `systemd/gpu-logo-schedule.timer` | Runs `gpu-logo tick` once a minute, touching the LED only when the schedule's dim factor changes. |
-| `systemd/gpu-logo-cpu.path`, `.service` | Watches `/var/lib/gpu-logo/cpu.wake` to start the CPU load sampler when `cpu` mode is selected; the sampler exits as soon as another mode replaces `cpu`. |
+| `systemd/gpu-logo-cpu.path`, `.service` | Watches `/var/lib/gpu-logo/cpu.wake` to start the CPU load sampler when `cpu` mode is selected (with bounded `Restart=on-failure` recovery); the sampler exits cleanly as soon as another mode replaces `cpu`. |
 | `modules-load.d/gpu-logo.conf` | Loads `ledtrig-pattern` and `ledtrig-timer` at boot. |
-| `/var/lib/gpu-logo/` | Root-owned directory holding the writer lock, root-only staging directory, `cpu.wake`, and group-writable `state/` (`state.json`, `schedule.json`, `applied.json`). Root validates every read and serializes updates through the lock. |
+| `/var/lib/gpu-logo/` | Root-owned directory holding the writer lock (`.lock`), daemon liveness lock (`.cpu.lock`), root-only staging directory, `cpu.wake`, and group-writable `state/` (`state.json`, `schedule.json`, `applied.json`). Root validates every read and serializes updates through the lock. |
 | `tools/observe.py` | Optional webcam helper (requires GStreamer `gst-launch-1.0` and Pillow) to verify changes visually. |
 | `tests/` | Unit tests for schedule math, validation, locking, pattern timing, and mode transitions against a fake LED directory: `python3 -m unittest discover tests`. |
 

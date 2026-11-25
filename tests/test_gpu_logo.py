@@ -66,7 +66,7 @@ class GpuLogoTest(unittest.TestCase):
         (self.led / "trigger").write_text("none\n")
         self.g = load_tool(self.led, self.state)
         self.g.SYNC_WAIT_S = 0  # a fake LED never reaches its resting level
-        self.g._wait_path_unit_armed = lambda timeout=2.0: None  # never query host systemd in unit tests
+        self.g._wait_path_unit_armed = lambda timeout=2.0, require_active=True: True  # never query host systemd in unit tests
         self.available_triggers = ["none", "timer", "pattern", "heartbeat", "activity", "disk-activity"]
         # A plain file cannot list the available triggers the way sysfs does.
         self.g.read_trigger = lambda: (self.attr("trigger"), list(self.available_triggers))
@@ -344,6 +344,57 @@ class SecurityAndStateTest(GpuLogoTest):
         with self.assertRaises(self.g.Fail):
             self.g.wake_cpu_daemon()
 
+    def test_wait_path_unit_armed_surfaces_inactive_failed_and_timeout(self):
+        # Load a fresh module copy with real _wait_path_unit_armed intact.
+        g = load_tool(self.led, self.state)
+        orig_which = g.shutil.which
+        orig_run = g.subprocess.run
+        g.shutil.which = lambda cmd: "/bin/systemctl" if cmd == "systemctl" else orig_which(cmd)
+        try:
+            class FakeRes:
+                def __init__(self, stdout, rc=0):
+                    self.stdout = stdout
+                    self.returncode = rc
+
+            g.subprocess.run = lambda *a, **kw: FakeRes("loaded\nfailed\ndead\n")
+            with self.assertRaises(g.Fail):
+                g._wait_path_unit_armed(timeout=0.05)
+
+            g.subprocess.run = lambda *a, **kw: FakeRes("loaded\nactive\nrunning\n")
+            with self.assertRaises(g.Fail):
+                g._wait_path_unit_armed(timeout=0.05)
+
+            g.subprocess.run = lambda *a, **kw: FakeRes("loaded\nactive\nwaiting\n")
+            self.assertTrue(g._wait_path_unit_armed(timeout=0.05))
+        finally:
+            g.shutil.which = orig_which
+            g.subprocess.run = orig_run
+
+    def test_failed_applied_write_invalidates_stale_cpu_state_and_blocks_daemon_undo(self):
+        self.g.show({"mode": "cpu"}, 1.0)
+        seen = self.g._applied_stamp()
+
+        def enospc(*_args, **_kwargs):
+            raise OSError(28, "No space left on device")
+
+        real_write_json = self.g.write_json
+        self.g.write_json = enospc
+        try:
+            with self.assertRaises(self.g.Fail):
+                self.g.show({"mode": "static", "level": 0}, 1.0)
+        finally:
+            self.g.write_json = real_write_json
+
+        # LED is off and stale cpu applied.json was invalidated so daemon cannot undo off.
+        self.assertEqual((self.attr("trigger"), self.attr("brightness")), ("none", "0"))
+        self.assertIsNone(self.g.load_applied())
+        keep, _, _ = self.g._cpu_daemon_step(seen, 0, 1.0, 4)
+        # Stamp changed because applied.json was unlinked; re-checking sees None and exits.
+        self.assertTrue(keep)
+        keep2, _, _ = self.g._cpu_daemon_step(self.g._applied_stamp(), 0, 1.0, 4)
+        self.assertFalse(keep2)
+        self.assertEqual((self.attr("trigger"), self.attr("brightness")), ("none", "0"))
+
     def test_udev_hook_tolerates_disappearing_trigger_attribute(self):
         pattern_attr = self.led / "pattern"
         pattern_attr.write_text("0 100\n")
@@ -509,19 +560,28 @@ class TickAndDaemonTest(GpuLogoTest):
         self.assertEqual(self.attr("trigger"), "pattern")
         self.assertEqual(self.attr("pattern"), self.g.heartbeat_pattern(1.0, 0.02))
 
-    def test_cpu_wake_and_daemon_failure_preserves_wake_file_and_releases_liveness_lock(self):
+    def test_overlapping_cpu_selection_during_daemon_failure_preserves_recovery(self):
         woke = [0]
         orig_wake = self.g.wake_cpu_daemon
-        self.g.wake_cpu_daemon = lambda: (woke.__setitem__(0, woke[0] + 1), orig_wake())[1]
+        self.g.wake_cpu_daemon = lambda require_path_active=True: (
+            woke.__setitem__(0, woke[0] + 1),
+            orig_wake(require_path_active=require_path_active),
+        )[1]
 
         self.g.show({"mode": "cpu"}, 1.0)
         self.assertEqual(woke[0], 1)
-        self.assertTrue(self.g.CPU_WAKE_FILE.is_file())
 
-        # While cpu_daemon holds its liveness lock, a failure through the
-        # cpu-daemon CLI entry point releases the lock without deleting cpu.wake.
-        self.g.cpu_times = lambda: (_ for _ in ()).throw(self.g.Fail("injected failure"))
+        # Simulate a newer CLI `gpu-logo cpu` committing *while* the old daemon holds
+        # .cpu.lock, immediately before the old daemon fails through `main()`.
         old_argv = sys.argv
+
+        def select_cpu_then_fail():
+            self.assertTrue(self.g._daemon_lock_held())
+            sys.argv = ["gpu-logo", "--no-save", "cpu"]
+            self.g.main()
+            raise self.g.Fail("injected failure")
+
+        self.g.cpu_times = select_cpu_then_fail
         sys.argv = ["gpu-logo", "cpu-daemon"]
         try:
             with self.assertRaises(SystemExit) as cm:
@@ -529,12 +589,19 @@ class TickAndDaemonTest(GpuLogoTest):
             self.assertIn("injected failure", str(cm.exception))
         finally:
             sys.argv = old_argv
-        self.assertFalse(self.g._daemon_lock_held())
-        self.assertTrue(self.g.CPU_WAKE_FILE.is_file())
 
-        # A subsequent cpu selection sees the liveness lock free and wakes again.
-        self.g.show({"mode": "cpu"}, 1.0)
-        self.assertEqual(woke[0], 2)
+        # The failed daemon exited non-zero (so systemd Restart=on-failure restarts it),
+        # released .cpu.lock cleanly, and left applied=cpu and cpu.wake intact.
+        self.assertFalse(self.g._daemon_lock_held())
+        self.assertEqual(self.g.load_applied(), ({"mode": "cpu"}, 1.0))
+        self.assertTrue(self.g.CPU_WAKE_FILE.is_file())
+        unit_text = (REPO / "systemd" / "gpu-logo-cpu.service").read_text()
+        self.assertIn("Restart=on-failure", unit_text)
+
+        # A restarted daemon can acquire .cpu.lock immediately.
+        restarted_fd = self.g._acquire_daemon_lock()
+        self.assertGreaterEqual(restarted_fd, 0)
+        self.g._release_fd(restarted_fd)
 
     def test_tick_without_a_schedule_does_nothing(self):
         self.g.tick()
@@ -574,13 +641,14 @@ class ObserveTest(unittest.TestCase):
             self.assertGreater(m["lit"], 50)
 
     def test_rejects_bad_series_durations(self):
-        for bad in ("0", "-2", "nan", "inf", "1e308", "101", "0.001"):
+        for bad in ("0", "-2", "nan", "inf", "1e308", "101", "0.03", "0.001"):
             res = subprocess.run(
                 [sys.executable, str(REPO / "tools" / "observe.py"), f"--series={bad}"],
                 capture_output=True, text=True, check=False,
             )
             self.assertEqual(res.returncode, 2, bad)
             self.assertIn("--series", res.stderr)
+            self.assertIn("0.04", res.stderr)
             self.assertNotIn("Traceback", res.stderr)
 
 
