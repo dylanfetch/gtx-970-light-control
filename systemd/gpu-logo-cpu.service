@@ -1,12 +1,15 @@
 [Unit]
 Description=Drive the gpu-logo CPU heartbeat
-# Started at boot and on every change to the saved state (see the .path unit).
-# It exits at once unless the cpu mode is showing, so frequent starts are
-# normal and must not trip systemd's rate limit.
-StartLimitIntervalSec=0
+# Started at boot and when cpu.wake is modified (see the .path unit).
+# Bounded restart on unexpected failure prevents stranding a concurrent cpu
+# selection while normal exits (mode != cpu) exit 0 and do not restart.
+StartLimitIntervalSec=10s
+StartLimitBurst=5
 
 [Service]
 ExecStart=/usr/local/bin/gpu-logo cpu-daemon
+Restart=on-failure
+RestartSec=1s
 LogLevelMax=notice
 
 [Install]

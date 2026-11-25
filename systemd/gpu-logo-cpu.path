@@ -1,9 +1,11 @@
 [Unit]
-Description=Start the gpu-logo CPU heartbeat when the mode changes
+Description=Start the gpu-logo CPU heartbeat when CPU mode is selected
 
 [Path]
-# gpu-logo replaces files in this directory whenever it changes the LED.
-PathChanged=/var/lib/gpu-logo
+# Watches a pre-created regular file under root-owned /var/lib/gpu-logo so
+# group members cannot replace it with a directory or trigger spurious starts
+# from temporary files.
+PathModified=/var/lib/gpu-logo/cpu.wake
 Unit=gpu-logo-cpu.service
 
 [Install]

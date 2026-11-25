@@ -14,12 +14,16 @@ just did and ask what the light is doing.
 2. **Confirm it is the light your human means, before installing anything.** As
    root, write `0` to `brightness` and ask whether the light went out, then
    write `255` and ask whether it came back. Done when they have said yes to
-   both. sysfs reads back whatever was written, so reading it proves nothing
-   about the light.
-3. **Check the group.** `gpu-logo` grants LED access to `plugdev`. If
-   `id -nG` lacks it, either add the user (takes effect at next login) or change
-   `GROUP` in `gpu-logo` to a group they are in.
-4. **Install.** `sudo ./install.sh`. Ask your human for the sudo password.
+   both. Reading `brightness` back only confirms the GPU's PWM register changed,
+   not that the physical logo LED is wired to it or lit — visual confirmation is
+   required.
+3. **Check the group.** `gpu-logo` grants LED and state-directory access to
+   `GROUP` (default `plugdev`). If `id -nG` lacks it, either add the user (takes
+   effect at next login) or change `GROUP` at the top of `gpu-logo` to a group
+   they are in; `install.sh` reads `GROUP` from `gpu-logo` automatically.
+4. **Install.** Run `sudo ./install.sh`. Use your environment's secure elevation
+   or secret-input prompt if available; otherwise have your human run the `sudo`
+   command directly rather than pasting their password into plain chat.
 5. **Verify as the normal user.** Run `gpu-logo off`, `gpu-logo on` and
    `gpu-logo breathe`, each without sudo, asking after each one. Done when your
    human has confirmed all three.
@@ -45,21 +49,22 @@ just did and ask what the light is doing.
 
 ## Optional: a camera instead of asking
 
-If a webcam happens to be pointed at the card, `tools/observe.py` can answer
-the "what is the light doing" questions for you. It counts lit pixels in the
-logo's region of a frame, and `--series SECONDS` samples over time to show an
-effect's shape. Its `ROI` is for one particular camera placement. To find
-yours, capture a frame at brightness 255 and another at 0 and take the bounding
-box of what changed.
+If a webcam happens to be pointed at the card, `tools/observe.py` (requires
+GStreamer `gst-launch-1.0` and Pillow) can answer the "what is the light doing"
+questions for you. It counts lit pixels in the logo's region of a frame, and
+`--series SECONDS` samples over time to show an effect's shape. Its `ROI` is
+for one particular camera placement. To find yours, capture a frame at
+brightness 255 and another at 0 and take the bounding box of what changed.
 
 ## Changing the code
 
-- The running copy is `/usr/local/bin/gpu-logo`. Edits to the repo take effect
-  after `sudo ./install.sh`.
+- The running copies are `/usr/local/bin/gpu-logo` plus the udev and systemd
+  files installed by `sudo ./install.sh`. Edits to the repo take effect after
+  re-running `sudo ./install.sh`.
 - `python3 -m unittest discover tests` covers the logic with a fake LED
   directory. It cannot tell you what the light did; for anything that touches
   the LED, ask your human or use the camera.
-- LED behaviour that is easy to get wrong. `gpu-logo` handles each of these,
+- LED behavior that is easy to get wrong. `gpu-logo` handles each of these,
   with a comment at the spot:
   - Writing `0` to `brightness` while a trigger is active removes the trigger.
   - A trigger's own attributes (`pattern`, `delay_on`, ...) are created
@@ -71,13 +76,24 @@ box of what changed.
     flashes at the LED's remembered blink brightness, left over from the
     previous effect. Set it explicitly.
   - The `pattern` trigger redraws a fade every 50 ms and spends one extra
-    redraw on each fading tuple, so a tuple written as 100 ms lasts 150.
+    redraw only when adjacent tuples have different brightness levels (holding
+    the same level takes the exact written duration).
   - Writing `pattern` restarts it from its first tuple. To change a running
-    pattern without a visible jump, wait until `brightness` reads the
-    pattern's resting level. The driver reads that back from hardware and can
-    return one count less than was written.
+    pattern without a visible jump, wait (bounded at `SYNC_WAIT_S`) until
+    `brightness` reads the pattern's resting level. The driver reads the PWM
+    register back from hardware and can return one count less than was written.
 - The kernel's `cpu` trigger accepts being selected and then never varies on
   this hardware, and its `activity` trigger reads as a strobe. The `cpu` mode
   here draws its own heartbeat instead.
-- `gpu-logo cpu-daemon` must check that its mode is still showing immediately
-  before every write. It once overwrote the mode that had replaced it.
+- Normal CLI, `tick`, `udev-hook` (`add`), and `cpu-daemon` updates serialize
+  LED writes, state files (`/var/lib/gpu-logo/state/`), and `.cpu.lock` handoff
+  through the root-owned `/var/lib/gpu-logo/.lock`. `cpu-daemon` re-checks the
+  active mode under that lock immediately before every write and releases
+  `.cpu.lock` under the lock on both clean and error exits. `gpu-logo-cpu.service`
+  uses bounded `Restart=on-failure` so an unexpected sampler failure cannot
+  strand a concurrent `cpu` selection, while a failed `applied.json` write
+  invalidates any stale record instead of letting `cpu-daemon` undo `off`.
+- `gpu-logo-cpu.path` watches the pre-created regular file
+  `/var/lib/gpu-logo/cpu.wake` (`PathModified=`) under root-owned
+  `/var/lib/gpu-logo/`, so temp files never trigger spurious starts and group
+  members cannot replace the trigger path with a directory or symlink.

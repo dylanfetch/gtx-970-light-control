@@ -1,7 +1,7 @@
 [Unit]
 Description=Follow the gpu-logo dimming schedule
 # Nothing to do, and nothing worth logging, until a schedule has been set.
-ConditionPathExists=/var/lib/gpu-logo/schedule.json
+ConditionPathExists=/var/lib/gpu-logo/state/schedule.json
 
 [Service]
 Type=oneshot

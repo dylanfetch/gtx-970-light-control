@@ -8,13 +8,18 @@ re-applied at boot by the udev rule, and an optional schedule dims whatever
 mode is showing at night.
 """
 import argparse
+import contextlib
+import errno
+import fcntl
 import json
+import math
 import os
 import re
+import secrets
 import shutil
+import stat
 import subprocess
 import sys
-import tempfile
 import time
 import zoneinfo
 from datetime import datetime
@@ -22,9 +27,14 @@ from pathlib import Path
 
 LED = Path(os.environ.get("GPU_LOGO_LED", "/sys/class/leds/nvidia-logo"))
 STATE_DIR = Path(os.environ.get("GPU_LOGO_STATE_DIR", "/var/lib/gpu-logo"))
-MODE_FILE = STATE_DIR / "state.json"  # mode to show, restored at boot
-SCHEDULE_FILE = STATE_DIR / "schedule.json"  # night dimming, if any
-APPLIED_FILE = STATE_DIR / "applied.json"  # what was last written to the LED
+DATA_DIR = STATE_DIR / "state"  # group-writable state files
+MODE_FILE = DATA_DIR / "state.json"  # mode to show, restored at boot
+SCHEDULE_FILE = DATA_DIR / "schedule.json"  # night dimming, if any
+APPLIED_FILE = DATA_DIR / "applied.json"  # what was last written to the LED
+LOCK_FILE = STATE_DIR / ".lock"  # root-owned immutable lock serializing writers
+CPU_LOCK_FILE = STATE_DIR / ".cpu.lock"  # held by cpu-daemon while active
+CPU_WAKE_FILE = STATE_DIR / "cpu.wake"  # pre-created file watched by gpu-logo-cpu.path
+ROOT_STAGE_DIR = STATE_DIR / ".root-tmp"  # root-only staging directory for atomic writes
 GROUP = "plugdev"
 # Attributes the udev hook hands to GROUP. The trigger-specific ones only exist
 # while their trigger is active.
@@ -34,7 +44,11 @@ DEFAULT_MODE = {"mode": "static", "level": 100}  # what the card does on its own
 GAMMA = 2.2  # PWM duty is linear but perceived brightness is not
 DAY_MIN = 24 * 60
 TICK_MS = 50  # the kernel's pattern trigger redraws a fade every 50 ms
-SYNC_WAIT_S = 5.0  # longest to wait for a running pattern to reach its resting level
+SYNC_WAIT_S = 5.0  # cap on waiting for a running pattern to reach its resting level
+LOCK_WAIT_S = 10.0  # cap on waiting for another writer to release the state lock
+MAX_JSON_BYTES = 16 * 1024  # state files are tiny; refuse symlinks, FIFOs and oversized files
+MIN_BREATHE_S = 0.2
+MAX_BREATHE_S = 600.0
 
 # The cpu mode's heartbeat, as (calm, flat out). Tune the feel here.
 BEAT_BPM = (20, 60)
@@ -46,7 +60,7 @@ BEAT_SETTLE_MS = (250, 150)
 CPU_SAMPLE_S = 2.0
 CPU_SMOOTHING = 0.3  # weight of each new sample: settles in roughly ten seconds
 CPU_CURVE = 0.75  # lifts the low end a little, so one busy core out of eight already shows
-CPU_STEPS = 8  # distinct heart rates between calm and flat out
+CPU_STEPS = 8  # intervals between calm and flat out (9 distinct levels, 0..8)
 
 
 class Fail(Exception):
@@ -92,45 +106,72 @@ def read_trigger() -> tuple[str, list[str]]:
     return active, [n.strip("[]") for n in names]
 
 
-def set_trigger(name: str, module: str | None = None) -> None:
+def ensure_trigger(name: str, module: str | None = None) -> None:
+    """Verify `name` is available, loading `module` when running as root."""
     _, available = read_trigger()
-    if name not in available and module:
+    if name in available:
+        return
+    if module:
         if os.geteuid() == 0:
             subprocess.run(["modprobe", "-q", module], check=False)
+            _, available = read_trigger()
+            if name in available:
+                return
         else:
             raise Fail(f"LED trigger '{name}' is not loaded; run: sudo modprobe {module}")
-    write_attr("trigger", name)
+    raise Fail(f"LED trigger '{name}' is not available on {LED}")
 
 
-def write_pattern(pattern: str, still_wanted=lambda: True) -> None:
-    """Start a pattern, seamlessly if one is already running.
+def wait_for_pattern_rest(still_wanted=lambda: True) -> None:
+    """Wait for a running pattern to return to its resting level (capped at SYNC_WAIT_S).
 
     Writing a pattern restarts it from its first tuple. Every pattern here
-    starts at its resting level, so wait for the running one to get back there
-    and the switch has no visible jump. `still_wanted` is asked after that
-    wait, for a caller whose reason to write may have gone in the meantime.
+    starts at its resting level, so waiting for the running one to get back
+    there avoids a visible jump.
     """
     try:
         resting = int((LED / "pattern").read_text().split()[0])
     except (OSError, ValueError, IndexError):
-        resting = None  # nothing running yet
+        return  # nothing running yet
     deadline = time.monotonic() + SYNC_WAIT_S
-    while resting is not None and time.monotonic() < deadline:
-        # The driver reads the level back from hardware, which can lose one count.
-        if resting - 1 <= int((LED / "brightness").read_text()) <= resting:
-            break
+    while time.monotonic() < deadline and still_wanted():
+        try:
+            # The driver reads the PWM register back and can return one count less.
+            if resting - 1 <= int((LED / "brightness").read_text()) <= resting:
+                return
+        except (OSError, ValueError):
+            return
         time.sleep(0.02)
+
+
+def write_pattern(pattern: str, still_wanted=lambda: True, wait_rest: bool = True) -> None:
+    """Start a pattern, optionally waiting for a running one to reach its resting level."""
+    if wait_rest:
+        wait_for_pattern_rest(still_wanted)
     if still_wanted():
         write_attr("pattern", pattern, wait=3.0)
+
+
+def _activate_pattern(pattern: str, wait_rest: bool = True) -> None:
+    """Ensure the pattern trigger is active and write `pattern`."""
+    if read_trigger()[0] != "pattern":
+        ensure_trigger("pattern", "ledtrig-pattern")
+        write_attr("trigger", "none")
+        write_attr("trigger", "pattern")
+    write_pattern(pattern, wait_rest=wait_rest)
 
 
 # --- patterns ----------------------------------------------------------------
 # A pattern is '<level> <ms>' tuples; the kernel fades from each level to the
 # next and wraps around at the end.
 
-def fade(level: int, ms: int) -> str:
-    """Tuple that fades from `level` to the next tuple's level in `ms` (a multiple of 50, at least 100)."""
-    return f"{level} {ms - TICK_MS}"  # the kernel spends one extra redraw on every fading tuple
+def step_tuple(level: int, next_level: int, ms: int) -> str:
+    """Format one tuple lasting `ms` ms (a multiple of 50, at least 100).
+
+    Linux's ledtrig-pattern spends one extra 50 ms redraw when fading to a
+    different level, and none when holding the same level.
+    """
+    return f"{level} {ms - TICK_MS if level != next_level else ms}"
 
 
 def whole_ticks(ms: float) -> int:
@@ -143,7 +184,8 @@ def breathe_pattern(period_ms: int, lo: int, hi: int) -> str:
     step_ms = whole_ticks(period_ms / (2 * steps))
     up = [round(lo + (hi - lo) * (i / steps) ** GAMMA) for i in range(steps + 1)]
     points = up[:-1] + up[:0:-1]  # rise, then fall; the repeat wraps back to up[0]
-    return " ".join(fade(level, step_ms) for level in points)
+    n = len(points)
+    return " ".join(step_tuple(points[i], points[(i + 1) % n], step_ms) for i in range(n))
 
 
 def heartbeat_pattern(effort: float, dim: float = 1.0) -> str | None:
@@ -162,8 +204,9 @@ def heartbeat_pattern(effort: float, dim: float = 1.0) -> str | None:
     dub = base + round((peak - base) * 0.6)  # the second, weaker beat
     rise, fall, settle = (whole_ticks(between(p)) for p in (BEAT_RISE_MS, BEAT_FALL_MS, BEAT_SETTLE_MS))
     rest = max(whole_ticks(60000 / between(BEAT_BPM)) - (2 * rise + fall + settle), 2 * TICK_MS)
-    return " ".join([fade(base, rise), fade(peak, fall), fade(dip, rise), fade(dub, settle),
-                     f"{base} {rest}"])  # same level as the first tuple, so this one just waits
+    tuples = [(base, rise), (peak, fall), (dip, rise), (dub, settle), (base, rest)]
+    n = len(tuples)
+    return " ".join(step_tuple(lvl, tuples[(i + 1) % n][0], ms) for i, (lvl, ms) in enumerate(tuples))
 
 
 # --- modes -------------------------------------------------------------------
@@ -200,7 +243,7 @@ def normalize(raw: object) -> dict:
     raise Fail(f"unknown mode: {mode!r}")
 
 
-def apply(state: dict, dim: float = 1.0) -> None:
+def apply(state: dict, dim: float = 1.0, wait_rest: bool = True) -> None:
     """Show `state` on the LED, with every brightness scaled by `dim` (0..1)."""
     mode = state["mode"]
 
@@ -212,29 +255,34 @@ def apply(state: dict, dim: float = 1.0) -> None:
         # The calm beat; the cpu daemon takes over from here and follows the load.
         pattern = heartbeat_pattern(0.0, dim)
     if pattern:
-        if read_trigger()[0] != "pattern":
-            write_attr("trigger", "none")
-            set_trigger("pattern", "ledtrig-pattern")
-        write_pattern(pattern)
+        _activate_pattern(pattern, wait_rest=wait_rest)
         return
 
-    # Drop the old trigger first: writing brightness 0 under an active trigger
-    # would remove it anyway, and this gives every mode a clean start.
-    write_attr("trigger", "none")
     if mode in ("breathe", "cpu"):  # dimmed so far that there is no swing left
         level = to_raw(state["max"] if mode == "breathe" else 100 * BEAT_PEAK[0] ** GAMMA, dim)
     else:
         level = to_raw(state.get("level", 100), dim)
+
+    # Check trigger availability before clearing whatever effect is currently showing.
+    if level > 0:
+        if mode == "blink":
+            ensure_trigger("timer", "ledtrig-timer")
+        elif mode == "disk":
+            ensure_trigger("disk-activity")
+
+    # Drop the old trigger first: writing brightness 0 under an active trigger
+    # would remove it anyway, and this gives every mode a clean start.
+    write_attr("trigger", "none")
     write_attr("brightness", level)
     if level == 0:
         return
     if mode == "blink":
         # The timer trigger blinks at whatever brightness was set when it started.
-        set_trigger("timer", "ledtrig-timer")
+        write_attr("trigger", "timer")
         write_attr("delay_on", state["on_ms"], wait=3.0)
         write_attr("delay_off", state["off_ms"], wait=3.0)
     elif mode == "disk":
-        set_trigger("disk-activity")
+        write_attr("trigger", "disk-activity")
         # This trigger flashes at the LED's remembered blink brightness, left
         # over from whatever ran before. Writing brightness sets that level.
         write_attr("brightness", level)
@@ -267,9 +315,11 @@ def normalize_schedule(raw: object) -> dict:
 
 
 def dim_at(s: dict, minute: float) -> float:
-    """Brightness factor (0..1) the schedule calls for at `minute` of the day.
+    """Brightness factor (0..1) the schedule calls for at local wall-clock `minute`.
 
-    Both fades follow a gamma curve so they look even to the eye.
+    Both fades follow a gamma curve so they look even to the eye. Evaluated on
+    wall-clock HH:MM, so fades crossing a DST transition repeat or skip the
+    shifted hour.
     """
     def ease(a: float, b: float, f: float) -> float:
         ga, gb = a ** (1 / GAMMA), b ** (1 / GAMMA)
@@ -294,10 +344,10 @@ def schedule_now(schedule: dict) -> datetime:
     return datetime.now(zoneinfo.ZoneInfo(tz)) if tz else datetime.now().astimezone()
 
 
-def current_dim(schedule: dict | None) -> float:
+def current_dim(schedule: dict | None, now: datetime | None = None) -> float:
     if not schedule:
         return 1.0
-    now = schedule_now(schedule)
+    now = schedule_now(schedule) if now is None else now
     return round(dim_at(schedule, now.hour * 60 + now.minute + now.second / 60), 3)
 
 
@@ -310,8 +360,8 @@ def parse_clock(text: str) -> int:
 
 def parse_span(text: str) -> tuple[int, int]:
     """'23:30-02:00' is a fade from one time to the other; a lone '02:00' switches at once."""
-    start, _, end = text.partition("-")
-    return parse_clock(start), parse_clock(end or start)
+    start, sep, end = text.partition("-")
+    return parse_clock(start), parse_clock(end if sep else start)
 
 
 def clock(minutes: int) -> str:
@@ -329,32 +379,300 @@ def describe_schedule(s: dict | None) -> str:
     now = schedule_now(s)
     return (f"dim to {s['level']}% {span(s['dim_start'], s['dim_end'])}, "
             f"brighten {span(s['bright_start'], s['bright_end'])} "
-            f"(now {now:%H:%M} {s.get('tz') or now.tzname()}, at {round(current_dim(s) * 100)}%)")
+            f"(now {now:%H:%M} {s.get('tz') or now.tzname()}, at {round(current_dim(s, now) * 100)}%)")
 
 
-# --- saved files -------------------------------------------------------------
+# --- saved files and locking -------------------------------------------------
+
+def _open_lock_fd(path: Path) -> int:
+    """Open a lock file without following symlinks; create it only if missing and allowed."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK, 0o640)
+        except OSError as e:
+            if e.errno == errno.ELOOP:
+                raise Fail(f"{path} must be a regular file, not a symlink") from e
+            hint = "" if os.geteuid() == 0 else " (re-run install.sh, join group, or use sudo)"
+            raise Fail(f"cannot open lock {path}: {e.strerror}{hint}") from e
+    except OSError as e:
+        if e.errno == errno.ELOOP:
+            raise Fail(f"{path} must be a regular file, not a symlink") from e
+        hint = "" if os.geteuid() == 0 else " (join group or use sudo)"
+        raise Fail(f"cannot open lock {path}: {e.strerror}{hint}") from e
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        os.close(fd)
+        raise Fail(f"{path} must be a regular file")
+    return fd
+
+
+@contextlib.contextmanager
+def state_lock(timeout: float = LOCK_WAIT_S):
+    """Serialize LED and state-file updates across the CLI, timer, udev and daemon.
+
+    In an installed setup STATE_DIR is root-owned (0750 root:GROUP) and LOCK_FILE
+    is immutable to group members (0640 root:GROUP), so all authorized writers
+    lock the same inode and fail closed if the lock cannot be acquired.
+    """
+    if not STATE_DIR.exists():
+        yield  # uninstalled checkout; no shared state directory exists
+        return
+    if not STATE_DIR.is_dir():
+        raise Fail(f"{STATE_DIR} is not a directory")
+    deadline = time.monotonic() + timeout
+    fd = -1
+    try:
+        while True:
+            fd = _open_lock_fd(LOCK_FILE)
+            st = os.fstat(fd)
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise Fail(f"timed out waiting for lock {LOCK_FILE}")
+                    time.sleep(0.02)
+            # Re-verify the inode in case an uninstalled/test directory was mutated.
+            try:
+                pst = os.lstat(LOCK_FILE)
+                if (pst.st_dev, pst.st_ino) == (st.st_dev, st.st_ino):
+                    break
+            except FileNotFoundError:
+                pass
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+            fd = -1
+        yield
+    finally:
+        if fd >= 0:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
+
+
+def _release_fd(fd: int | None) -> None:
+    if fd is not None and fd >= 0:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
+def _acquire_daemon_lock() -> int | None:
+    """Acquire the non-blocking liveness/singleton lock held by cpu-daemon."""
+    if not STATE_DIR.exists():
+        return None
+    fd = _open_lock_fd(CPU_LOCK_FILE)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return fd
+    except BlockingIOError:
+        os.close(fd)
+        return -1  # another cpu-daemon is already running
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _daemon_lock_held() -> bool:
+    """Return True if cpu-daemon currently holds its liveness lock."""
+    if not STATE_DIR.exists():
+        return False
+    try:
+        fd = os.open(CPU_LOCK_FILE, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return False
+    except OSError as e:
+        if e.errno == errno.ELOOP:
+            raise Fail(f"{CPU_LOCK_FILE} must be a regular file, not a symlink") from e
+        raise Fail(f"cannot open {CPU_LOCK_FILE}: {e.strerror}") from e
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise Fail(f"{CPU_LOCK_FILE} must be a regular file")
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return False
+    finally:
+        os.close(fd)
+
+
+def _wait_path_unit_armed(timeout: float = 2.0, require_active: bool = True) -> bool:
+    """Wait for gpu-logo-cpu.path to be armed (SubState=waiting).
+
+    Returns True if a wake write should proceed, False if a live daemon has
+    already taken over while waiting, and raises Fail when systemd reports an
+    installed path unit is inactive/failed or fails to re-arm before timeout.
+    """
+    if not shutil.which("systemctl"):
+        return True
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            res = subprocess.run(
+                ["systemctl", "show", "-p", "LoadState,ActiveState,SubState", "--value", "gpu-logo-cpu.path"],
+                capture_output=True, text=True, timeout=1.0, check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return True
+        if res.returncode != 0:
+            return True  # systemd not running (e.g. container)
+        lines = [line.strip() for line in res.stdout.splitlines() if line.strip()]
+        if len(lines) < 3 or lines[0] == "not-found":
+            return True  # unit not installed
+        _, active_state, sub_state = lines[0], lines[1], lines[2]
+        if active_state != "active":
+            if not require_active:
+                return True  # early boot udev add; multi-user.target starts the service
+            raise Fail(f"gpu-logo-cpu.path is {active_state}; run: sudo systemctl enable --now gpu-logo-cpu.path")
+        if sub_state != "running":
+            return True  # path watch is armed (waiting)
+        if _daemon_lock_held():
+            return False  # a fresh daemon already acquired the liveness lock
+        if time.monotonic() >= deadline:
+            if not require_active:
+                return True
+            raise Fail("timed out waiting for gpu-logo-cpu.path to re-arm; check systemctl status gpu-logo-cpu.service")
+        time.sleep(0.02)
+
+
+def wake_cpu_daemon(require_path_active: bool = True) -> None:
+    """Signal systemd's gpu-logo-cpu.path to start cpu-daemon via cpu.wake."""
+    if not STATE_DIR.exists():
+        return  # uninstalled checkout
+    if not _wait_path_unit_armed(require_active=require_path_active):
+        return
+    try:
+        fd = os.open(CPU_WAKE_FILE, os.O_WRONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError as e:
+        raise Fail(f"{CPU_WAKE_FILE} not found (re-run install.sh)") from e
+    except OSError as e:
+        if e.errno == errno.ELOOP:
+            raise Fail(f"{CPU_WAKE_FILE} must be a regular file, not a symlink") from e
+        raise Fail(f"cannot write {CPU_WAKE_FILE}: {e.strerror}") from e
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise Fail(f"{CPU_WAKE_FILE} must be a regular file")
+        os.ftruncate(fd, 0)
+        os.write(fd, b"1\n")
+    finally:
+        os.close(fd)
+
 
 def read_json(path: Path) -> object | None:
+    """Read a small regular JSON file without following symlinks or blocking on FIFOs."""
     try:
-        return json.loads(path.read_text())
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except FileNotFoundError:
         return None
-    except ValueError as e:
+    except OSError as e:
+        if e.errno == errno.ELOOP:
+            raise Fail(f"{path} must be a regular file, not a symlink") from e
+        raise Fail(f"cannot read {path}: {e.strerror}") from e
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise Fail(f"{path} must be a regular file")
+        if st.st_size > MAX_JSON_BYTES:
+            raise Fail(f"{path} is too large")
+        with os.fdopen(fd, "rb") as f:
+            fd = -1
+            raw = f.read(MAX_JSON_BYTES + 1)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    if len(raw) > MAX_JSON_BYTES:
+        raise Fail(f"{path} is too large")
+    try:
+        return json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError, RecursionError) as e:
         raise Fail(f"{path} is not valid JSON") from e
 
 
-def write_json(path: Path, data: object) -> None:
+def _open_stage_dir(parent_fd: int, parent: Path) -> tuple[int, bool]:
+    """Return (dir_fd, should_close) for staging atomic writes.
+
+    When running as root for DATA_DIR, stage inside root-only ROOT_STAGE_DIR
+    under root-owned STATE_DIR so group members cannot replace the staging
+    directory or its temp files before rename.
+    """
+    if os.geteuid() != 0:
+        return parent_fd, False
+    if parent == DATA_DIR:
+        base_fd = os.open(STATE_DIR, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            bst = os.fstat(base_fd)
+            if bst.st_uid != 0 or (bst.st_mode & 0o022):
+                raise Fail(f"unsafe state directory: {STATE_DIR}")
+            try:
+                os.mkdir(ROOT_STAGE_DIR.name, 0o700, dir_fd=base_fd)
+            except FileExistsError:
+                pass
+            stage_fd = os.open(ROOT_STAGE_DIR.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=base_fd)
+        except Fail:
+            os.close(base_fd)
+            raise
+        except OSError as e:
+            os.close(base_fd)
+            raise Fail(f"unsafe staging directory {ROOT_STAGE_DIR}: {e.strerror}") from e
+        os.close(base_fd)
+        try:
+            st = os.fstat(stage_fd)
+            if st.st_uid != 0 or (st.st_mode & 0o077):
+                raise Fail(f"unsafe staging directory: {ROOT_STAGE_DIR}")
+        except BaseException:
+            os.close(stage_fd)
+            raise
+        return stage_fd, True
+    return parent_fd, False
+
+
+def _atomic_write(path: Path, payload: bytes) -> None:
+    """Atomically replace `path` with `payload`, applying permissions on the open fd."""
     # Replace rather than overwrite: root and the user both write these, and a
     # rename only needs the directory to be writable, whoever owns the old file.
-    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".")
+    parent_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    stage_fd = -1
+    close_stage = False
     try:
-        with os.fdopen(fd, "w") as f:
-            f.write(json.dumps(data) + "\n")
-        os.chmod(tmp, 0o664)
-        os.replace(tmp, path)
-    except BaseException:
-        os.unlink(tmp)
-        raise
+        stage_fd, close_stage = _open_stage_dir(parent_fd, path.parent)
+        while True:
+            tmp_name = f".{path.name}.{secrets.token_hex(8)}"
+            try:
+                fd = os.open(tmp_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=stage_fd)
+                break
+            except FileExistsError:
+                continue
+        try:
+            with os.fdopen(fd, "wb") as f:
+                fd = -1
+                f.write(payload)
+                f.flush()
+                if stage_fd != parent_fd:
+                    os.fchown(f.fileno(), -1, os.fstat(parent_fd).st_gid)
+                os.fchmod(f.fileno(), 0o660)
+            os.replace(tmp_name, path.name, src_dir_fd=stage_fd, dst_dir_fd=parent_fd)
+        except BaseException:
+            if fd >= 0:
+                os.close(fd)
+            try:
+                os.unlink(tmp_name, dir_fd=stage_fd)
+            except OSError:
+                pass
+            raise
+    finally:
+        if close_stage and stage_fd >= 0:
+            os.close(stage_fd)
+        os.close(parent_fd)
+
+
+def write_json(path: Path, data: object) -> None:
+    _atomic_write(path, (json.dumps(data) + "\n").encode("utf-8"))
 
 
 def load_mode() -> dict | None:
@@ -387,21 +705,56 @@ def load_applied() -> tuple[dict, float] | None:
         dim = raw.get("dim")
         if isinstance(dim, bool) or not isinstance(dim, (int, float)):
             return None
-        return normalize(raw.get("state")), float(dim)
-    except Fail:
+        dim_f = float(dim)
+        if not math.isfinite(dim_f) or not 0.0 <= dim_f <= 1.0:
+            return None
+        return normalize(raw.get("state")), dim_f
+    except (Fail, OverflowError):
+        return None
+
+
+def _applied_stamp() -> tuple[int, int] | None:
+    try:
+        st = os.lstat(APPLIED_FILE)
+        return st.st_mtime_ns, st.st_ino
+    except FileNotFoundError:
         return None
 
 
 def record_applied(state: dict, dim: float) -> None:
+    """Publish the applied mode and dim factor.
+
+    No-op when uninstalled (STATE_DIR absent). In an installed setup, failures
+    invalidate any stale applied record so cpu-daemon cannot re-apply an old
+    CPU mode over a newer off/static selection, then raise Fail.
+    """
+    if not STATE_DIR.exists():
+        return
     try:
         write_json(APPLIED_FILE, {"boot": boot_id(), "state": state, "dim": dim})
-    except OSError:
-        pass  # not installed; only costs the schedule its memory of what is showing
+    except OSError as e:
+        try:
+            APPLIED_FILE.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise Fail(f"cannot record applied state {APPLIED_FILE}: {e.strerror}") from e
+
+
+def _show_locked(state: dict, dim: float, wait_rest: bool = True) -> bool:
+    """Apply `state` and record it while holding `state_lock`.
+
+    Returns True if cpu-daemon needs to be woken after releasing the lock.
+    """
+    apply(state, dim, wait_rest=wait_rest)
+    record_applied(state, dim)
+    return state["mode"] == "cpu" and not _daemon_lock_held()
 
 
 def show(state: dict, dim: float) -> None:
-    apply(state, dim)
-    record_applied(state, dim)
+    with state_lock():
+        needs_wake = _show_locked(state, dim)
+    if needs_wake:
+        wake_cpu_daemon()
 
 
 def showing() -> dict:
@@ -419,57 +772,108 @@ def cpu_times() -> tuple[int, int]:
 
 
 def next_step(effort: float, current: int | None) -> int:
-    """Quantise effort (0..1) to a heart rate step, holding the current one near a boundary."""
+    """Quantize effort (0..1) to a heart rate step, holding the current one near a boundary."""
     exact = effort * CPU_STEPS
     return current if current is not None and abs(exact - current) <= 0.75 else round(exact)
+
+
+def _cpu_daemon_step(seen: tuple[int, int] | None, step: int | None, dim: float,
+                     wanted: int, on_exit=lambda: None) -> tuple[bool, int | None, bool]:
+    """Apply one heartbeat step if `cpu` mode is still active.
+
+    Returns (keep_running, new_step, stamp_changed).
+    """
+    pattern = heartbeat_pattern(wanted / CPU_STEPS, dim)
+    if pattern and read_trigger()[0] == "pattern":
+        wait_for_pattern_rest(still_wanted=lambda: _applied_stamp() == seen)
+    with state_lock():
+        if _applied_stamp() != seen:
+            return True, step, True
+        applied = load_applied()
+        if not applied or applied[0]["mode"] != "cpu":
+            on_exit()
+            return False, step, False
+        dim = applied[1]
+        pattern = heartbeat_pattern(wanted / CPU_STEPS, dim)
+        if pattern:
+            _activate_pattern(pattern, wait_rest=False)
+        else:
+            level = to_raw(100 * BEAT_PEAK[0] ** GAMMA, dim)
+            if read_trigger()[0] != "none" or int((LED / "brightness").read_text()) != level:
+                apply({"mode": "cpu"}, dim, wait_rest=False)
+        return True, wanted, False
 
 
 def cpu_daemon() -> None:
     """Keep the cpu mode's heartbeat in step with CPU load.
 
-    systemd starts this at boot and whenever the state directory changes. It
-    returns at once unless the cpu mode is showing, and returns when another
-    mode replaces it, so nothing lingers for the other modes.
+    systemd starts this at boot and whenever cpu.wake is written. It holds
+    CPU_LOCK_FILE while active, releases it under state_lock before exiting,
+    and returns immediately unless cpu mode is showing. Unexpected failures
+    exit non-zero so systemd's bounded Restart=on-failure restarts the sampler
+    without stranding a concurrent cpu selection.
     """
-    if load_applied() is None:  # nothing has drawn on the LED this boot
-        state = load_mode() or DEFAULT_MODE
-        if state["mode"] != "cpu":
-            return
-        show(state, current_dim(load_schedule()))
+    if not LED.exists():
+        return
+    daemon_fd: int | None = None
 
-    def stamp() -> tuple[int, int] | None:
-        try:
-            st = APPLIED_FILE.stat()
-            return st.st_mtime_ns, st.st_ino
-        except FileNotFoundError:
-            return None
+    def release_daemon() -> None:
+        nonlocal daemon_fd
+        _release_fd(daemon_fd)
+        daemon_fd = None
 
-    seen = step = smooth = None
-    dim = 1.0
-    busy_before, total_before = cpu_times()
-    while True:
-        current = stamp()
-        if current != seen:
-            seen = current
+    try:
+        with state_lock():
+            daemon_fd = _acquire_daemon_lock()
+            if daemon_fd == -1:
+                daemon_fd = None
+                return  # another cpu-daemon is already running
             applied = load_applied()
-            if not applied or applied[0]["mode"] != "cpu":
+            if applied is None:  # nothing has drawn on the LED this boot
+                state = load_mode() or DEFAULT_MODE
+                if state["mode"] != "cpu":
+                    release_daemon()
+                    return
+                _show_locked(state, current_dim(load_schedule()))
+            elif applied[0]["mode"] != "cpu":
+                release_daemon()
                 return
-            # The LED was redrawn at the calm beat, or the dimming changed.
-            dim, step = applied[1], None
-        busy, total = cpu_times()
-        if total > total_before:  # false only on the first pass
-            load = (busy - busy_before) / (total - total_before)
-            busy_before, total_before = busy, total
-            smooth = load if smooth is None else smooth + CPU_SMOOTHING * (load - smooth)
-            wanted = next_step(min(smooth, 1.0) ** CPU_CURVE, step)
-            if wanted != step and read_trigger()[0] == "pattern":
-                pattern = heartbeat_pattern(wanted / CPU_STEPS, dim)
-                if pattern:
-                    # Another mode may take the LED while this waits for the beat to rest.
-                    write_pattern(pattern, still_wanted=lambda: stamp() == seen)
-                step = wanted
-        # Sleep last, so a mode change is always noticed before the next write.
-        time.sleep(CPU_SAMPLE_S)
+
+        seen = step = smooth = None
+        dim = 1.0
+        busy_before, total_before = cpu_times()
+        while True:
+            with state_lock():
+                current = _applied_stamp()
+                if current != seen:
+                    seen = current
+                    applied = load_applied()
+                    if not applied or applied[0]["mode"] != "cpu":
+                        release_daemon()
+                        return
+                    # The LED was redrawn at the calm beat, or the dimming changed.
+                    dim, step = applied[1], None
+            busy, total = cpu_times()
+            if total > total_before:  # false only on the first pass
+                load = (busy - busy_before) / (total - total_before)
+                busy_before, total_before = busy, total
+                smooth = load if smooth is None else smooth + CPU_SMOOTHING * (load - smooth)
+                wanted = next_step(min(smooth, 1.0) ** CPU_CURVE, step)
+                if wanted != step:
+                    keep_running, step, changed = _cpu_daemon_step(seen, step, dim, wanted, on_exit=release_daemon)
+                    if not keep_running:
+                        return
+                    if changed:
+                        continue
+            # Sleep last, so a mode change is always noticed before the next write.
+            time.sleep(CPU_SAMPLE_S)
+    finally:
+        if daemon_fd is not None:
+            try:
+                with state_lock(timeout=1.0):
+                    release_daemon()
+            except Fail:
+                release_daemon()
 
 
 # --- commands ----------------------------------------------------------------
@@ -478,40 +882,69 @@ def udev_hook() -> None:
     """Run as root by the udev rule on add/change events for the LED."""
     for attr in ATTRS:
         path = LED / attr
-        if path.exists():
+        try:
             shutil.chown(path, group=GROUP)
             path.chmod(0o664)
+        except FileNotFoundError:
+            continue  # trigger attributes can disappear if the trigger changes concurrently
     # Only on "add": applying a mode sets a trigger, which emits a "change"
     # event, and restoring on that too would loop.
     if os.environ.get("ACTION") == "add":
-        mode, schedule = load_mode(), load_schedule()
-        if mode or schedule:
-            show(mode or DEFAULT_MODE, current_dim(schedule))
+        needs_wake = False
+        with state_lock(timeout=2.0):
+            mode, schedule = load_mode(), load_schedule()
+            if mode or schedule:
+                needs_wake = _show_locked(mode or DEFAULT_MODE, current_dim(schedule))
+        if needs_wake:
+            wake_cpu_daemon(require_path_active=False)
 
 
 def tick() -> None:
     """Run every minute by the systemd timer: follow the schedule."""
-    schedule = load_schedule()
-    if not schedule:
+    # If a breathing pattern needs dimming, wait for its resting level before
+    # taking the lock so CLI commands do not stall behind a multi-second wait.
+    pre_schedule = load_schedule()
+    if not pre_schedule:
         return
-    dim = current_dim(schedule)
-    applied = load_applied()
-    # Re-applying would restart a running effect, so only act on a change.
-    if applied and applied[1] == dim:
+    pre_dim = current_dim(pre_schedule)
+    pre_applied = load_applied()
+    if pre_applied and pre_applied[1] == pre_dim:
         return
-    state = showing()
-    if state["mode"] == "cpu" and read_trigger()[0] == "pattern":
-        # The cpu daemon watches this record and redraws at the new level;
-        # applying here would drop the heartbeat back to calm first.
-        record_applied(state, dim)
-    else:
-        show(state, dim)
+    pre_state = pre_applied[0] if pre_applied else load_mode() or DEFAULT_MODE
+    if pre_state["mode"] == "breathe" and read_trigger()[0] == "pattern":
+        before = _applied_stamp()
+        wait_for_pattern_rest(still_wanted=lambda: _applied_stamp() == before)
+
+    needs_wake = False
+    with state_lock():
+        schedule = load_schedule()
+        if not schedule:
+            return
+        dim = current_dim(schedule)
+        applied = load_applied()
+        # Re-applying would restart a running effect, so only act on a change.
+        if applied and applied[1] == dim:
+            return
+        state = applied[0] if applied else load_mode() or DEFAULT_MODE
+        if (state["mode"] == "cpu" and read_trigger()[0] == "pattern"
+                and heartbeat_pattern(0.0, dim) is not None):
+            # The cpu daemon watches this record and redraws at the new level;
+            # applying here would drop the heartbeat back to calm first.
+            record_applied(state, dim)
+            needs_wake = not _daemon_lock_held()
+        else:
+            needs_wake = _show_locked(state, dim, wait_rest=False)
+    if needs_wake:
+        wake_cpu_daemon()
 
 
 def schedule_command(a: argparse.Namespace) -> None:
     if a.off:
-        SCHEDULE_FILE.unlink(missing_ok=True)
-        show(showing(), 1.0)
+        with state_lock():
+            SCHEDULE_FILE.unlink(missing_ok=True)
+            needs_wake = _show_locked(showing(), 1.0)
+        if needs_wake:
+            wake_cpu_daemon()
         print("schedule: none")
         return
     if a.dim is None and a.brighten is None:
@@ -522,11 +955,14 @@ def schedule_command(a: argparse.Namespace) -> None:
     (dim_start, dim_end), (bright_start, bright_end) = parse_span(a.dim), parse_span(a.brighten)
     schedule = normalize_schedule({"dim_start": dim_start, "dim_end": dim_end, "bright_start": bright_start,
                                    "bright_end": bright_end, "level": a.level, "tz": a.tz})
-    try:
-        write_json(SCHEDULE_FILE, schedule)
-    except OSError as e:
-        raise Fail(f"cannot save {SCHEDULE_FILE}: {e.strerror} (run install.sh)") from e
-    show(showing(), current_dim(schedule))
+    with state_lock():
+        try:
+            write_json(SCHEDULE_FILE, schedule)
+        except OSError as e:
+            raise Fail(f"cannot save {SCHEDULE_FILE}: {e.strerror} (run install.sh)") from e
+        needs_wake = _show_locked(showing(), current_dim(schedule))
+    if needs_wake:
+        wake_cpu_daemon()
     print(f"schedule: {describe_schedule(schedule)}")
 
 
@@ -564,7 +1000,7 @@ def main() -> None:
     s.add_argument("--on", type=int, default=500, metavar="MS", dest="on_ms")
     s.add_argument("--off", type=int, default=500, metavar="MS", dest="off_ms")
     s.add_argument("--level", type=int, default=100, metavar="PERCENT")
-    sub.add_parser("cpu", help="heartbeat that follows CPU load: slow and soft when calm, faster and stronger when busy")
+    sub.add_parser("cpu", help="heartbeat that follows CPU load")
     sub.add_parser("disk", help="flicker on disk activity")
     s = sub.add_parser(
         "schedule", help="dim at night (no arguments: show the schedule)",
@@ -586,9 +1022,9 @@ def main() -> None:
     a = p.parse_args()
 
     try:
+        if a.cmd == "cpu-daemon":
+            return cpu_daemon()
         if not LED.exists():
-            if a.cmd == "cpu-daemon":
-                return  # no LED to drive; the udev hook's first write restarts this
             raise Fail(f"{LED} not found: is the card running on the nouveau driver?")
         if a.cmd == "status":
             return status()
@@ -596,34 +1032,41 @@ def main() -> None:
             return udev_hook()
         if a.cmd == "tick":
             return tick()
-        if a.cmd == "cpu-daemon":
-            return cpu_daemon()
         if a.cmd == "schedule":
             return schedule_command(a)
         if a.cmd == "restore":
-            state = load_mode()
-            if not state:
-                raise Fail("no saved mode")
-            return show(state, current_dim(load_schedule()))
+            with state_lock():
+                state = load_mode()
+                if not state:
+                    raise Fail("no saved mode")
+                needs_wake = _show_locked(state, current_dim(load_schedule()))
+            if needs_wake:
+                wake_cpu_daemon()
+            return
 
         if a.cmd in ("on", "off"):
             raw = {"mode": "static", "level": 100 if a.cmd == "on" else 0}
         elif a.cmd == "set":
             raw = {"mode": "static", "level": a.level}
         elif a.cmd == "breathe":
+            if not math.isfinite(a.period) or not MIN_BREATHE_S <= a.period <= MAX_BREATHE_S:
+                raise Fail(f"period must be between {MIN_BREATHE_S:g} and {MAX_BREATHE_S:g} seconds")
             raw = {"mode": "breathe", "period_ms": round(a.period * 1000), "min": a.min, "max": a.max}
         elif a.cmd == "blink":
             raw = {"mode": "blink", "on_ms": a.on_ms, "off_ms": a.off_ms, "level": a.level}
         else:
             raw = {"mode": a.cmd}
         state = normalize(raw)
-        show(state, current_dim(load_schedule()))
-        if not a.no_save:
-            try:
-                write_json(MODE_FILE, state)
-            except OSError as e:
-                print(f"note: applied, but could not save for next boot ({MODE_FILE}: {e.strerror})",
-                      file=sys.stderr)
+        with state_lock():
+            needs_wake = _show_locked(state, current_dim(load_schedule()))
+            if not a.no_save:
+                try:
+                    write_json(MODE_FILE, state)
+                except OSError as e:
+                    print(f"note: applied, but could not save for next boot ({MODE_FILE}: {e.strerror})",
+                          file=sys.stderr)
+        if needs_wake:
+            wake_cpu_daemon()
     except Fail as e:
         sys.exit(f"gpu-logo: {e}")
 
