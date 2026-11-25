@@ -79,16 +79,18 @@ brightness 255 and another at 0 and take the bounding box of what changed.
     redraw only when adjacent tuples have different brightness levels (holding
     the same level takes the exact written duration).
   - Writing `pattern` restarts it from its first tuple. To change a running
-    pattern without a visible jump, wait until `brightness` reads the
-    pattern's resting level. The driver reads the PWM register back from
-    hardware and can return one count less than was written.
+    pattern without a visible jump, wait (bounded at `SYNC_WAIT_S`) until
+    `brightness` reads the pattern's resting level. The driver reads the PWM
+    register back from hardware and can return one count less than was written.
 - The kernel's `cpu` trigger accepts being selected and then never varies on
   this hardware, and its `activity` trigger reads as a strobe. The `cpu` mode
   here draws its own heartbeat instead.
-- `gpu-logo cpu-daemon` and `gpu-logo tick` serialize LED and state updates
-  through `/var/lib/gpu-logo/.lock` and re-check the active mode under the lock
-  immediately before every write, so neither can overwrite a newer mode.
-- `gpu-logo-cpu.path` watches the level-triggered `/var/lib/gpu-logo/cpu.active`
-  marker (`PathExists=`) rather than the whole directory, so temp files never
-  fire spurious starts and rapid `off -> cpu` switches cannot be missed while
-  the daemon is exiting.
+- Normal CLI, `tick`, `udev-hook` (`add`), and `cpu-daemon` updates serialize
+  LED writes, state files (`/var/lib/gpu-logo/state/`), and `.cpu.lock` handoff
+  through the root-owned `/var/lib/gpu-logo/.lock`. `cpu-daemon` re-checks the
+  active mode under that lock immediately before every write and releases
+  `.cpu.lock` under the lock before exiting.
+- `gpu-logo-cpu.path` watches the pre-created regular file
+  `/var/lib/gpu-logo/cpu.wake` (`PathModified=`) under root-owned
+  `/var/lib/gpu-logo/`, so temp files never trigger spurious starts and group
+  members cannot replace the trigger path with a directory or symlink.

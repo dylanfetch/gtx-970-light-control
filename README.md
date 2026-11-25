@@ -118,8 +118,8 @@ Most of the speed change happens in the pause between beats: the beat itself
 tightens from 0.7 s to 0.45 s, while the rest shrinks from 2.3 s to 0.55 s.
 Total CPU usage across all logical cores is sampled every 2 seconds and
 smoothed over ~10 seconds so brief spikes barely register. Pace and brightness
-move in nine quantized steps, and every update waits for the rest between beats
-so the rhythm never jumps.
+move in nine quantized steps, and updates wait (capped at five seconds) for the
+rest between beats to avoid visible rhythm jumps.
 
 Five seconds each of calm and flat out, captured through the webcam at 15
 chars/sec (each row is auto-scaled to its own peak brightness, so the calm
@@ -143,9 +143,9 @@ kernel LED device `nouveau` exposes.
 | `gpu-logo` | CLI. Fixed levels write `brightness`; effects program a kernel LED trigger. No background process stays running except in `cpu` mode. |
 | `udev/70-gpu-logo-led.rules` | Runs `gpu-logo udev-hook` as root on `add`/`change` events: grants `GROUP` write access to the LED's sysfs attributes and restores the saved mode on `add`. |
 | `systemd/gpu-logo-schedule.timer` | Runs `gpu-logo tick` once a minute, touching the LED only when the schedule's dim factor changes. |
-| `systemd/gpu-logo-cpu.path`, `.service` | Starts the CPU load sampler while `/var/lib/gpu-logo/cpu.active` exists, and exits as soon as another mode replaces `cpu`. |
+| `systemd/gpu-logo-cpu.path`, `.service` | Watches `/var/lib/gpu-logo/cpu.wake` to start the CPU load sampler when `cpu` mode is selected; the sampler exits as soon as another mode replaces `cpu`. |
 | `modules-load.d/gpu-logo.conf` | Loads `ledtrig-pattern` and `ledtrig-timer` at boot. |
-| `/var/lib/gpu-logo/` | Saved mode, schedule, and last applied state. Group-writable, so root validates every read, stages writes privately, and serializes updates with a lock. |
+| `/var/lib/gpu-logo/` | Root-owned directory holding the writer lock, root-only staging directory, `cpu.wake`, and group-writable `state/` (`state.json`, `schedule.json`, `applied.json`). Root validates every read and serializes updates through the lock. |
 | `tools/observe.py` | Optional webcam helper (requires GStreamer `gst-launch-1.0` and Pillow) to verify changes visually. |
 | `tests/` | Unit tests for schedule math, validation, locking, pattern timing, and mode transitions against a fake LED directory: `python3 -m unittest discover tests`. |
 

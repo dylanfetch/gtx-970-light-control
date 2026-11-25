@@ -5,12 +5,12 @@ Run from the repository root:  python3 -m unittest discover tests
 import fcntl
 import importlib.machinery
 import importlib.util
-import io
 import os
 import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from datetime import datetime
 from pathlib import Path
@@ -53,14 +53,20 @@ class GpuLogoTest(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.led = Path(tmp.name) / "led"
-        self.state = Path(tmp.name) / "state"
+        self.state = Path(tmp.name) / "state-root"
+        self.data = self.state / "state"
         self.led.mkdir()
         self.state.mkdir()
+        self.data.mkdir()
+        (self.state / ".lock").write_text("")
+        (self.state / ".cpu.lock").write_text("")
+        (self.state / "cpu.wake").write_text("")
         (self.led / "max_brightness").write_text("255\n")
         (self.led / "brightness").write_text("255\n")
         (self.led / "trigger").write_text("none\n")
         self.g = load_tool(self.led, self.state)
         self.g.SYNC_WAIT_S = 0  # a fake LED never reaches its resting level
+        self.g._wait_path_unit_armed = lambda timeout=2.0: None  # never query host systemd in unit tests
         self.available_triggers = ["none", "timer", "pattern", "heartbeat", "activity", "disk-activity"]
         # A plain file cannot list the available triggers the way sysfs does.
         self.g.read_trigger = lambda: (self.attr("trigger"), list(self.available_triggers))
@@ -163,15 +169,15 @@ class NormalizeTest(GpuLogoTest):
     def test_drops_unknown_keys(self):
         self.assertEqual(self.g.normalize({"mode": "disk", "extra": "x"}), {"mode": "disk"})
 
-    def test_cli_rejects_non_finite_breathe_period(self):
-        for bad in ("nan", "inf", "-inf"):
+    def test_cli_rejects_non_finite_and_overflowing_breathe_period(self):
+        for bad in ("nan", "inf", "-inf", "1e308", "0.1", "601"):
             res = subprocess.run(
                 [sys.executable, str(REPO / "gpu-logo"), "breathe", f"--period={bad}"],
                 env=os.environ | {"GPU_LOGO_LED": str(self.led), "GPU_LOGO_STATE_DIR": str(self.state)},
                 capture_output=True, text=True, check=False,
             )
-            self.assertNotEqual(res.returncode, 0)
-            self.assertIn("finite", res.stderr)
+            self.assertNotEqual(res.returncode, 0, bad)
+            self.assertIn("period must be between", res.stderr)
             self.assertNotIn("Traceback", res.stderr)
 
 
@@ -261,48 +267,57 @@ class HeartbeatTest(GpuLogoTest):
 
 
 class SecurityAndStateTest(GpuLogoTest):
-    def test_read_json_rejects_symlinks_fifos_and_oversized_files(self):
-        target = self.state / "real.json"
+    def test_read_json_rejects_symlinks_fifos_oversized_and_deep_nesting(self):
+        target = self.data / "real.json"
         target.write_text('{"mode": "disk"}\n')
-        link = self.state / "link.json"
+        link = self.data / "link.json"
         link.symlink_to(target)
         with self.assertRaises(self.g.Fail):
             self.g.read_json(link)
 
-        fifo = self.state / "fifo.json"
+        fifo = self.data / "fifo.json"
         os.mkfifo(fifo)
         with self.assertRaises(self.g.Fail):
             self.g.read_json(fifo)
 
-        big = self.state / "big.json"
+        big = self.data / "big.json"
         big.write_text(" " * (self.g.MAX_JSON_BYTES + 10))
         with self.assertRaises(self.g.Fail):
             self.g.read_json(big)
 
+        deep = self.data / "deep.json"
+        deep.write_text('{"mode": "disk"}\n')
+        real_loads = self.g.json.loads
+        self.g.json.loads = lambda _s: (_ for _ in ()).throw(RecursionError("deep"))
+        try:
+            with self.assertRaises(self.g.Fail):
+                self.g.read_json(deep)
+        finally:
+            self.g.json.loads = real_loads
+
     def test_write_json_replaces_symlink_without_touching_target(self):
-        victim = self.state / "victim.txt"
+        victim = self.data / "victim.txt"
         victim.write_text("untouched")
         victim.chmod(0o600)
-        link = self.state / "state.json"
+        link = self.data / "state.json"
         link.symlink_to(victim)
 
         self.g.write_json(link, {"mode": "disk"})
         self.assertFalse(link.is_symlink())
-        self.assertEqual(stat.S_IMODE(link.stat().st_mode), 0o664)
+        self.assertEqual(stat.S_IMODE(link.stat().st_mode), 0o660)
         self.assertEqual(victim.read_text(), "untouched")
         self.assertEqual(stat.S_IMODE(victim.stat().st_mode), 0o600)
 
-    def test_load_applied_rejects_out_of_range_and_non_finite_dim(self):
-        for bad_dim in [-0.1, 1.1, float("nan"), float("inf"), True, "0.5"]:
-            (self.state / "applied.json").write_text(
-                f'{{"boot": "{self.g.boot_id()}", "state": {{"mode": "cpu"}}, "dim": '
-                + ("NaN" if bad_dim != bad_dim else "Infinity" if bad_dim == float("inf")
-                   else "true" if bad_dim is True else repr(bad_dim).replace("'", '"'))
-                + "}\n"
+    def test_load_applied_rejects_out_of_range_non_finite_and_overflow_dim(self):
+        huge_int = "1" + "0" * 400
+        for raw_dim in ("-0.1", "1.1", "NaN", "Infinity", "true", '"0.5"', huge_int):
+            (self.data / "applied.json").write_text(
+                f'{{"boot": "{self.g.boot_id()}", "state": {{"mode": "cpu"}}, "dim": {raw_dim}}}\n'
             )
-            self.assertIsNone(self.g.load_applied(), bad_dim)
+            self.assertIsNone(self.g.load_applied(), raw_dim)
 
-    def test_state_lock_rejects_symlink_and_times_out_when_contended(self):
+    def test_state_lock_rejects_symlink_fails_closed_and_times_out_when_contended(self):
+        self.g.LOCK_FILE.unlink()
         other = self.state / "other"
         other.write_text("")
         self.g.LOCK_FILE.symlink_to(other)
@@ -312,7 +327,7 @@ class SecurityAndStateTest(GpuLogoTest):
         self.g.LOCK_FILE.unlink()
 
         self.g.LOCK_FILE.write_text("")
-        with open(self.g.LOCK_FILE, "r+b") as holder:
+        with open(self.g.LOCK_FILE, "rb") as holder:
             fcntl.flock(holder.fileno(), fcntl.LOCK_EX)
             try:
                 with self.assertRaises(self.g.Fail):
@@ -320,6 +335,14 @@ class SecurityAndStateTest(GpuLogoTest):
                         pass
             finally:
                 fcntl.flock(holder.fileno(), fcntl.LOCK_UN)
+
+    def test_wake_cpu_daemon_surfaces_invalid_or_missing_wake_file(self):
+        self.g.CPU_WAKE_FILE.unlink()
+        with self.assertRaises(self.g.Fail):
+            self.g.wake_cpu_daemon()
+        self.g.CPU_WAKE_FILE.mkdir()
+        with self.assertRaises(self.g.Fail):
+            self.g.wake_cpu_daemon()
 
     def test_udev_hook_tolerates_disappearing_trigger_attribute(self):
         pattern_attr = self.led / "pattern"
@@ -332,7 +355,6 @@ class SecurityAndStateTest(GpuLogoTest):
             if Path(path).name == "pattern":
                 pattern_attr.unlink()
                 raise FileNotFoundError(path)
-            # Don't require the real plugdev group in unit tests.
             return None
 
         self.g.shutil.chown = flaky_chown
@@ -371,7 +393,6 @@ class TickAndDaemonTest(GpuLogoTest):
         self.g.tick()
         self.assertEqual(self.attr("pattern"), before)
         self.assertEqual(self.g.load_applied(), ({"mode": "cpu"}, 0.25))
-        self.assertTrue(self.g.CPU_ACTIVE_FILE.exists())
 
     def test_tick_turns_off_running_heartbeat_at_dim_zero_and_restores_it(self):
         dim_value = [0.0]
@@ -390,7 +411,6 @@ class TickAndDaemonTest(GpuLogoTest):
         self.g.tick()
         self.assertEqual(self.attr("trigger"), "pattern")
         self.assertEqual(self.g.load_applied(), ({"mode": "cpu"}, 0.5))
-        self.assertTrue(self.g.CPU_ACTIVE_FILE.exists())
 
     def test_tick_does_not_overwrite_newer_cli_off_during_pattern_wait(self):
         self.g.current_dim = lambda schedule, now=None: 0.25 if schedule else 1.0
@@ -402,6 +422,55 @@ class TickAndDaemonTest(GpuLogoTest):
 
         self.g.wait_for_pattern_rest = cli_turns_off_mid_wait
         self.g.tick()
+        self.assertEqual((self.attr("trigger"), self.attr("brightness")), ("none", "0"))
+        self.assertEqual(self.g.load_applied(), ({"mode": "static", "level": 0}, 0.25))
+
+    def test_state_lock_serializes_overlapping_tick_and_cli_write(self):
+        """A second writer must block until tick's locked transaction finishes.
+
+        This fails immediately if state_lock is removed or replaced with a no-op.
+        """
+        self.g.current_dim = lambda schedule, now=None: 0.25 if schedule else 1.0
+        self.g.show({"mode": "static", "level": 80}, 1.0)
+        self.set_schedule(25)
+
+        tick_in_apply = threading.Event()
+        release_tick = threading.Event()
+        cli_in_apply = threading.Event()
+        real_apply = self.g.apply
+
+        def gated_apply(state, dim=1.0, wait_rest=True):
+            if state["level"] == 80:
+                tick_in_apply.set()
+                release_tick.wait(timeout=2.0)
+            else:
+                cli_in_apply.set()
+            return real_apply(state, dim, wait_rest=wait_rest)
+
+        self.g.apply = gated_apply
+        errors = []
+
+        def run(fn):
+            try:
+                fn()
+            except BaseException as e:
+                errors.append(e)
+
+        t_tick = threading.Thread(target=run, args=(self.g.tick,))
+        t_tick.start()
+        self.assertTrue(tick_in_apply.wait(timeout=2.0))
+
+        t_cli = threading.Thread(target=run, args=(lambda: self.g.show({"mode": "static", "level": 0}, 0.25),))
+        t_cli.start()
+        # While tick holds state_lock inside apply(), CLI must not enter apply().
+        self.assertFalse(cli_in_apply.wait(timeout=0.1))
+
+        release_tick.set()
+        t_tick.join(timeout=2.0)
+        t_cli.join(timeout=2.0)
+        self.assertEqual(errors, [])
+        self.assertTrue(cli_in_apply.is_set())
+        # CLI ran strictly after tick completed, so off wins.
         self.assertEqual((self.attr("trigger"), self.attr("brightness")), ("none", "0"))
         self.assertEqual(self.g.load_applied(), ({"mode": "static", "level": 0}, 0.25))
 
@@ -421,7 +490,6 @@ class TickAndDaemonTest(GpuLogoTest):
         self.assertTrue(changed)
         self.assertEqual(step, 0)
         self.assertEqual(self.attr("pattern"), self.g.breathe_pattern(4000, 0, 255))
-        self.assertFalse(self.g.CPU_ACTIVE_FILE.exists())
 
     def test_cpu_daemon_step_turns_off_at_dim_zero_and_restarts_pattern(self):
         self.g.show({"mode": "cpu"}, 1.0)
@@ -441,11 +509,32 @@ class TickAndDaemonTest(GpuLogoTest):
         self.assertEqual(self.attr("trigger"), "pattern")
         self.assertEqual(self.attr("pattern"), self.g.heartbeat_pattern(1.0, 0.02))
 
-    def test_cpu_active_flag_tracks_mode(self):
+    def test_cpu_wake_and_daemon_failure_preserves_wake_file_and_releases_liveness_lock(self):
+        woke = [0]
+        orig_wake = self.g.wake_cpu_daemon
+        self.g.wake_cpu_daemon = lambda: (woke.__setitem__(0, woke[0] + 1), orig_wake())[1]
+
         self.g.show({"mode": "cpu"}, 1.0)
-        self.assertTrue(self.g.CPU_ACTIVE_FILE.exists())
-        self.g.show({"mode": "static", "level": 0}, 1.0)
-        self.assertFalse(self.g.CPU_ACTIVE_FILE.exists())
+        self.assertEqual(woke[0], 1)
+        self.assertTrue(self.g.CPU_WAKE_FILE.is_file())
+
+        # While cpu_daemon holds its liveness lock, a failure through the
+        # cpu-daemon CLI entry point releases the lock without deleting cpu.wake.
+        self.g.cpu_times = lambda: (_ for _ in ()).throw(self.g.Fail("injected failure"))
+        old_argv = sys.argv
+        sys.argv = ["gpu-logo", "cpu-daemon"]
+        try:
+            with self.assertRaises(SystemExit) as cm:
+                self.g.main()
+            self.assertIn("injected failure", str(cm.exception))
+        finally:
+            sys.argv = old_argv
+        self.assertFalse(self.g._daemon_lock_held())
+        self.assertTrue(self.g.CPU_WAKE_FILE.is_file())
+
+        # A subsequent cpu selection sees the liveness lock free and wakes again.
+        self.g.show({"mode": "cpu"}, 1.0)
+        self.assertEqual(woke[0], 2)
 
     def test_tick_without_a_schedule_does_nothing(self):
         self.g.tick()
@@ -458,11 +547,15 @@ class TickAndDaemonTest(GpuLogoTest):
 
 
 class ObserveTest(unittest.TestCase):
-    def test_measure_checks_frame_bounds_and_counts_lit_pixels(self):
+    def setUp(self):
         try:
-            from PIL import Image
+            import PIL  # noqa: F401
         except ImportError:
             self.skipTest("Pillow not installed")
+
+    def test_measure_checks_frame_bounds_and_counts_lit_pixels(self):
+        from PIL import Image
+
         obs = load_observe()
         with tempfile.TemporaryDirectory() as d:
             small = Path(d) / "small.jpg"
@@ -481,12 +574,13 @@ class ObserveTest(unittest.TestCase):
             self.assertGreater(m["lit"], 50)
 
     def test_rejects_bad_series_durations(self):
-        for bad in ("0", "-2", "nan", "inf", "0.001"):
+        for bad in ("0", "-2", "nan", "inf", "1e308", "101", "0.001"):
             res = subprocess.run(
-                [sys.executable, str(REPO / "tools" / "observe.py"), "--series", bad],
+                [sys.executable, str(REPO / "tools" / "observe.py"), f"--series={bad}"],
                 capture_output=True, text=True, check=False,
             )
-            self.assertNotEqual(res.returncode, 0, bad)
+            self.assertEqual(res.returncode, 2, bad)
+            self.assertIn("--series", res.stderr)
             self.assertNotIn("Traceback", res.stderr)
 
 

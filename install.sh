@@ -23,13 +23,160 @@ install -m 755 "$here/gpu-logo" /usr/local/bin/gpu-logo
 install -m 644 "$here/udev/70-gpu-logo-led.rules" /etc/udev/rules.d/70-gpu-logo-led.rules
 install -m 644 "$here/modules-load.d/gpu-logo.conf" /etc/modules-load.d/gpu-logo.conf
 install -m 644 "$here"/systemd/gpu-logo-* /etc/systemd/system/
-# setgid + group-writable so members of $group can save the mode and schedule.
-install -d -m 2775 -g "$group" /var/lib/gpu-logo
-# Root-only staging directory for atomic writes by privileged hooks/services.
-install -d -m 700 -o root -g root /var/lib/gpu-logo/.root-tmp
-if [ ! -e /var/lib/gpu-logo/.lock ]; then
-    install -m 664 -g "$group" /dev/null /var/lib/gpu-logo/.lock
-fi
+
+# Provision /var/lib/gpu-logo safely without following symlinks:
+#   /var/lib/gpu-logo           0750 root:$group  (immutable to group members)
+#   /var/lib/gpu-logo/.root-tmp 0700 root:root    (privileged atomic write staging)
+#   /var/lib/gpu-logo/.lock     0640 root:$group  (shared writer lock)
+#   /var/lib/gpu-logo/.cpu.lock 0640 root:$group  (cpu-daemon liveness lock)
+#   /var/lib/gpu-logo/cpu.wake  0660 root:$group  (watched by gpu-logo-cpu.path)
+#   /var/lib/gpu-logo/state     2770 root:$group  (group-writable JSON state)
+python3 - "$group" <<'PY'
+import grp
+import os
+import secrets
+import stat
+import sys
+from pathlib import Path
+
+group = sys.argv[1]
+gid = grp.getgrnam(group).gr_gid
+base = Path("/var/lib/gpu-logo")
+max_json = 16 * 1024
+
+try:
+    os.mkdir(base, 0o750)
+except FileExistsError:
+    pass
+base_fd = os.open(base, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+try:
+    # Remove group write on the top-level directory FIRST so group members
+    # cannot swap any control entries inside it during upgrade or reinstall.
+    os.fchown(base_fd, 0, gid)
+    os.fchmod(base_fd, 0o750)
+
+    def ensure_dir(name: str, owner_gid: int, mode: int) -> int:
+        try:
+            st = os.lstat(name, dir_fd=base_fd)
+            if not stat.S_ISDIR(st.st_mode):
+                os.unlink(name, dir_fd=base_fd)
+                os.mkdir(name, mode, dir_fd=base_fd)
+        except FileNotFoundError:
+            os.mkdir(name, mode, dir_fd=base_fd)
+        dfd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=base_fd)
+        os.fchown(dfd, 0, owner_gid)
+        os.fchmod(dfd, mode)
+        return dfd
+
+    def ensure_file(name: str, owner_gid: int, mode: int) -> None:
+        try:
+            st = os.lstat(name, dir_fd=base_fd)
+            if not stat.S_ISREG(st.st_mode):
+                if stat.S_ISDIR(st.st_mode):
+                    raise SystemExit(f"install.sh: unexpected directory at {base / name}")
+                os.unlink(name, dir_fd=base_fd)
+        except FileNotFoundError:
+            pass
+        fd = os.open(name, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK, mode, dir_fd=base_fd)
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise SystemExit(f"install.sh: {base / name} is not a regular file")
+            os.fchown(fd, 0, owner_gid)
+            os.fchmod(fd, mode)
+        finally:
+            os.close(fd)
+
+    def write_fresh(dst_dir_fd: int, stage_dir_fd: int, name: str, data: bytes) -> None:
+        while True:
+            tmp = f".{name}.{secrets.token_hex(8)}"
+            try:
+                wfd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=stage_dir_fd)
+                break
+            except FileExistsError:
+                continue
+        try:
+            with os.fdopen(wfd, "wb") as f:
+                wfd = -1
+                f.write(data)
+                f.flush()
+                os.fchown(f.fileno(), 0, gid)
+                os.fchmod(f.fileno(), 0o660)
+            os.replace(tmp, name, src_dir_fd=stage_dir_fd, dst_dir_fd=dst_dir_fd)
+        except BaseException:
+            if wfd >= 0:
+                os.close(wfd)
+            try:
+                os.unlink(tmp, dir_fd=stage_dir_fd)
+            except OSError:
+                pass
+            raise
+
+    def read_regular(dir_fd: int, name: str) -> bytes | None:
+        try:
+            rfd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)
+        except FileNotFoundError:
+            return None
+        try:
+            st = os.fstat(rfd)
+            if not stat.S_ISREG(st.st_mode) or st.st_size > max_json:
+                raise SystemExit(f"install.sh: unsafe or oversized state file '{name}'")
+            with os.fdopen(rfd, "rb") as f:
+                rfd = -1
+                data = f.read(max_json + 1)
+            if len(data) > max_json:
+                raise SystemExit(f"install.sh: oversized state file '{name}'")
+            return data
+        finally:
+            if rfd >= 0:
+                os.close(rfd)
+
+    stage_fd = ensure_dir(".root-tmp", 0, 0o700)
+    try:
+        ensure_file(".lock", gid, 0o640)
+        ensure_file(".cpu.lock", gid, 0o640)
+        ensure_file("cpu.wake", gid, 0o660)
+
+        state_fd = ensure_dir("state", gid, 0o2770)
+        try:
+            # Migrate legacy top-level JSON files into state/ by copying into fresh
+            # root:$group inodes (never chowning untrusted inodes in place).
+            for name in ("state.json", "schedule.json", "applied.json"):
+                try:
+                    data = read_regular(base_fd, name)
+                except OSError:
+                    os.unlink(name, dir_fd=base_fd)
+                    continue
+                if data is not None:
+                    try:
+                        os.lstat(name, dir_fd=state_fd)
+                    except FileNotFoundError:
+                        write_fresh(state_fd, stage_fd, name, data)
+                    os.unlink(name, dir_fd=base_fd)
+
+            # Clean up legacy cpu.active marker if present at top level.
+            try:
+                st = os.lstat("cpu.active", dir_fd=base_fd)
+                if not stat.S_ISDIR(st.st_mode):
+                    os.unlink("cpu.active", dir_fd=base_fd)
+            except FileNotFoundError:
+                pass
+
+            # Re-stage existing regular state files under the current group so a
+            # GROUP change on reinstall revokes access from the previous group.
+            for name in ("state.json", "schedule.json", "applied.json"):
+                try:
+                    data = read_regular(state_fd, name)
+                except OSError as e:
+                    raise SystemExit(f"install.sh: unsafe state file {base / 'state' / name}: {e.strerror}") from e
+                if data is not None:
+                    write_fresh(state_fd, stage_fd, name, data)
+        finally:
+            os.close(state_fd)
+    finally:
+        os.close(stage_fd)
+finally:
+    os.close(base_fd)
+PY
 
 udevadm control --reload
 # "change" fixes permissions now without re-applying any saved mode

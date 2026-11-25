@@ -1,6 +1,6 @@
 [Unit]
 Description=Drive the gpu-logo CPU heartbeat
-# Started at boot and while cpu.active exists (see the .path unit).
+# Started at boot and when cpu.wake is modified (see the .path unit).
 # Allow rapid manual switches while still preventing a runaway crash loop.
 StartLimitIntervalSec=10s
 StartLimitBurst=15

@@ -22,6 +22,7 @@ from PIL import Image
 DEVICE = "/dev/video0"
 FPS = 30  # expected default camera rate; actual elapsed time is printed in --series mode
 WARMUP_FRAMES = 20  # lets auto-exposure settle
+MAX_SERIES_S = 100.0  # stays within the 120 s capture timeout and GStreamer's int num-buffers
 # Logo bounding box in a 640x360 frame (x0, y0, x1, y1). Re-tune if the webcam moves.
 ROI = (296, 166, 370, 196)
 
@@ -78,11 +79,10 @@ def main() -> None:
         print(f"{out}  {w}x{h}  R={m['r']:.1f} G={m['g']:.1f} B={m['b']:.1f}  lit_px={m['lit']}/{m['n']}")
         return
 
-    if not math.isfinite(a.series) or a.series <= 0:
-        ap.error("--series must be a positive finite number of seconds")
-    sample_frames = round(a.series * FPS)
-    if sample_frames < 1:
-        ap.error(f"--series must be long enough for at least one frame (>= {1 / FPS:.2f}s at {FPS} fps)")
+    min_series = 1 / FPS
+    if not math.isfinite(a.series) or not min_series <= a.series <= MAX_SERIES_S:
+        ap.error(f"--series must be between {min_series:.2f} and {MAX_SERIES_S:g} seconds")
+    sample_frames = max(1, round(a.series * FPS))
 
     t0 = time.monotonic()
     with tempfile.TemporaryDirectory() as d:
